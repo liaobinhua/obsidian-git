@@ -1,0 +1,9 @@
+{
+  "id": "wudao-git",
+  "name": "Wudao Git",
+  "version": "0.1.0",
+  "minAppVersion": "1.13.0",
+  "description": "Review selected files and outgoing commits before manually syncing with GitHub.",
+  "author": "Binhua Liao",
+  "isDesktopOnly": true
+}
