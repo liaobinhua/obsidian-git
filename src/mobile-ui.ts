@@ -127,10 +127,11 @@ export class DownloadModal extends ReviewModal {
     }
     const approval = confirmation(this.contentEl, this.plan.deletions);
     this.actions('应用已检查的更新', async () => {
+      const choices = { ...resolutions };
       const approved = approval();
-      const effective = this.plan.deletions.filter(path => resolutions[path] !== 'local');
-      const result = await this.engine.applyPull(this.plan, resolutions, { deletions: approved.deletions.filter(path => effective.includes(path)), bulkDelete: approved.bulkDelete });
-      new Notice(appliedSummary(this.plan, resolutions, result.preserved), 14000); this.close();
+      const effective = this.plan.deletions.filter(path => choices[path] !== 'local');
+      const result = await this.engine.applyPull(this.plan, choices, { deletions: approved.deletions.filter(path => effective.includes(path)), bulkDelete: approved.bulkDelete });
+      new Notice(appliedSummary(this.plan, choices, result.preserved), 14000); this.close();
     });
   }
 }
