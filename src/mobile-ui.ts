@@ -143,7 +143,7 @@ export class MobileSettingsTab extends PluginSettingTab {
     this.containerEl.empty(); this.containerEl.createEl('h2', { text: 'Wudao Git · Android' });
     this.containerEl.createEl('p', { text: `当前版本：${this.plugin.manifest.version}。${this.plugin.modeLabel()}。` });
     this.containerEl.createEl('a', { text: '查看插件安装包与升级说明', href: 'https://github.com/liaobinhua/obsidian-git/releases', attr: { target: '_blank', rel: 'noopener noreferrer' } });
-    this.containerEl.createEl('p', { text: '首次使用请在空白文库下载。手机使用专用令牌，不会共享电脑钥匙串。' });
+    this.containerEl.createEl('p', { text: '已有文章可原位连接并比较。手机使用本机专用令牌引用，不共享电脑钥匙串。配置与同步记录独立保存在文库配置目录的 wudao-git/ 中。' });
     const next: MobileSettings = { ...this.plugin.settings };
     new Setting(this.containerEl).setName('GitHub 仓库').setDesc('填写文章仓库的 owner/repository；它与下载插件的源码仓库可以不同。').addText(text => { text.setValue(next.repository).setPlaceholder('owner/repository').onChange(value => { next.repository = value; }); });
     new Setting(this.containerEl).setName('分支').addText(text => { text.setValue(next.branch).onChange(value => { next.branch = value; }); });
@@ -152,6 +152,7 @@ export class MobileSettingsTab extends PluginSettingTab {
     new Setting(this.containerEl).setName('允许上传').setDesc('默认关闭。首次下载并检查内容后，再启用手机上传。').addToggle(toggle => { toggle.setValue(next.uploadEnabled).onChange(value => { next.uploadEnabled = value; }); });
     new Setting(this.containerEl).addButton(button => { button.setButtonText('保存设置').setCta().onClick(() => { void this.plugin.configure(next); }); });
     new Setting(this.containerEl).addButton(button => { button.setButtonText('保存并检查远端更新').onClick(async () => { if (await this.plugin.configure(next)) await this.plugin.showPull(); }); });
-    this.containerEl.createEl('p', { text: '已有文章的文库不会被当作空白文库覆盖。更换仓库或分支时，请创建新的空白文库。' });
+    new Setting(this.containerEl).addButton(button=>{button.setButtonText('打开版本控制').onClick(()=>{void this.plugin.openPanel();});});
+    this.containerEl.createEl('p', { text: '正常升级会延续原同步关系。记录缺失时使用“连接现有文库”，记录损坏时使用“修复同步记录并重新比较”。已有记录的仓库或分支变更仍需单独核对。' });
   }
 }

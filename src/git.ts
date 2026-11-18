@@ -1,10 +1,12 @@
 import { execFile } from 'node:child_process';
 import { createHash } from 'node:crypto';
 import { constants } from 'node:fs';
-import { copyFile, lstat, mkdtemp, open, realpath, rename, rm } from 'node:fs/promises';
+import { copyFile, lstat, mkdtemp, open, readFile, realpath, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
 import { allowedPath } from './mobile/policy.ts';
+import { NativeSync, nativeMetadata } from './native-sync.ts';
+import type { Confirmation, PullPlan, Resolution } from './mobile/types.ts';
 export { allowedPath } from './mobile/policy.ts';
 
 const MAX_BYTES = 20 * 1024 * 1024;
@@ -36,6 +38,8 @@ export interface Review {
   head: string;
   branch: string;
   changes: Change[];
+  staged?: boolean;
+  indexDigest?: string;
 }
 
 export interface OutgoingCommit { hash: string; subject: string; files: string[] }
@@ -55,6 +59,9 @@ export class Repository {
   readonly repository: string;
   readonly url: string;
   private busy = false;
+  private sync?: NativeSync;
+  private disposed=false;
+  dispose():void{this.disposed=true;void this.sync?.clearPlans().catch(()=>{console.warn('Wudao Git 临时预览清理未完成。');});}
 
   constructor(root: string, repository: string) {
     if (!/^[A-Za-z0-9][A-Za-z0-9-]{0,38}\/[A-Za-z0-9][A-Za-z0-9_.-]{0,99}$/.test(repository) || repository.endsWith('.git')) {
@@ -66,6 +73,7 @@ export class Repository {
   }
 
   private async run(args: string[], input?: Buffer | string, index?: string): Promise<Buffer> {
+    if(this.disposed)throw new Error('插件已停用，操作已停止。');
     return new Promise((accept, reject) => {
       const child = execFile('/usr/bin/git', [
         '-c', 'core.hooksPath=/dev/null', '-c', 'core.fsmonitor=false', '-c', 'core.askPass=',
@@ -134,12 +142,33 @@ export class Repository {
     const raw = (await this.run(['status', '--porcelain=v1', '-z', '--untracked-files=all', '--no-renames'])).toString('utf8');
     const result = raw.split('\0').filter(Boolean).map(entry => ({ status: entry.slice(0, 2), path: entry.slice(3) }));
     if (result.some(entry => entry.status.includes('U') || ['AA', 'DD'].includes(entry.status))) throw new Error('仓库存在冲突，请先使用外部 Git 解决。');
-    if (result.some(entry => entry.status !== '??' && entry.status[0] !== ' ')) throw new Error('发现已暂存的内容，请先使用外部 Git 处理，避免混入本次提交。');
     return result;
   }
 
-  async readDocument(path: string): Promise<Buffer | null> {
-    if (!allowedPath(path)) throw new Error('此文件不在允许上传的文档范围内。');
+  private async indexDigest(): Promise<string> {
+    const path = join(this.root, '.git/index');
+    try {
+      const stat = await lstat(path);
+      if (!stat.isFile() || stat.isSymbolicLink() || stat.size > 32 * 1024 * 1024) throw new Error('Git 暂存区不是安全的普通文件。');
+      return this.digest(await readFile(path));
+    } catch (error) { if ((error as NodeJS.ErrnoException).code === 'ENOENT') return 'missing'; throw error; }
+  }
+
+  private async indexDocument(path: string,metadata=false): Promise<Buffer | null> {
+    if (!allowedPath(path)&&!(metadata&&nativeMetadata(path))) throw new Error('暂存文件不在允许范围内。');
+    const entry = (await this.run(['ls-files', '--stage', '-z', '--', path])).toString('utf8');
+    if (!entry) return null;
+    if (!/^100(?:644|755) [a-f0-9]{40} 0\t/.test(entry)) throw new Error('暂存区包含链接或未解决冲突。');
+    const hash = entry.split(' ')[1]!;
+    if (Number(await this.text(['cat-file', '-s', hash])) > MAX_BYTES) throw new Error('暂存文件超过 20 MiB。');
+    const bytes = await this.run(['cat-file', 'blob', hash]);
+    if (SECRET.test(bytes.toString('utf8'))) throw new Error('暂存内容包含疑似令牌或私钥。');
+    return bytes;
+  }
+
+  async readDocument(path: string, raw = false, metadata=false): Promise<Buffer | null> {
+    if(this.disposed)throw new Error('插件已停用，操作已停止。');
+    if (!allowedPath(path)&&!(metadata&&nativeMetadata(path))) throw new Error('此文件不在允许上传的文档范围内。');
     const parts = path.split('/');
     let current = this.root;
     for (const [i, part] of parts.entries()) {
@@ -160,7 +189,7 @@ export class Repository {
       const bytes = await file.readFile();
       const after = await file.stat();
       if (bytes.length > MAX_BYTES || before.mtimeMs !== after.mtimeMs || before.size !== after.size) throw new Error('文件读取期间发生变化，请重新检查。');
-      if (SECRET.test(bytes.toString('utf8'))) throw new Error('文件中发现疑似令牌或私钥，请移除后重新检查。');
+      if (!raw && SECRET.test(bytes.toString('utf8'))) throw new Error('文件中发现疑似令牌或私钥，请移除后重新检查。');
       return bytes;
     } finally { await file.close(); }
   }
@@ -180,22 +209,68 @@ export class Repository {
         changes.push({ ...item, allowed: false, reason: error instanceof Error ? error.message : '文件无法安全读取', digest: '' });
       }
     }
-    return { head: state.head, branch: state.branch, changes };
+    return { head: state.head, branch: state.branch, changes, indexDigest: await this.indexDigest() };
+  }
+
+  async reviewStaged(): Promise<Review> {
+    if (this.busy) throw new Error('已有 Git 操作正在进行。');
+    const state = await this.guard(); const digest = await this.indexDigest(); const changes: Change[] = [];
+    for (const item of await this.changes()) {
+      if (item.status === '??' || item.status[0] === ' ') continue;
+      try { const bytes = await this.indexDocument(item.path); changes.push({ ...item, allowed: true, reason: '', digest: this.digest(bytes) }); }
+      catch (error) { changes.push({ ...item, allowed: false, reason: error instanceof Error ? error.message : '暂存内容无法读取', digest: '' }); }
+    }
+    if (await this.indexDigest() !== digest) throw new Error('暂存区已变化，请重新检查。');
+    return { head: state.head, branch: state.branch, staged: true, indexDigest: digest, changes };
+  }
+
+  async stage(review: Review, selected: string[]): Promise<void> {
+    return this.exclusive(async () => {
+      await this.ready();
+      const state = await this.guard();
+      if (!selected.length || new Set(selected).size !== selected.length || state.head !== review.head || state.branch !== review.branch) throw new Error('选择或提交已变化，请重新检查。');
+      const entries:string[]=[];
+      for (const path of selected) {
+        const change = review.changes.find(change => change.path === path && change.allowed);
+        const bytes=await this.readDocument(path);
+        if (!change || this.digest(bytes) !== change.digest) throw new Error('文件已变化，请重新检查后暂存。');
+        const hash=bytes===null?'0'.repeat(40):(await this.run(['hash-object','-w','--stdin','--no-filters'],bytes)).toString('utf8').trim();
+        entries.push(`${bytes===null?'0':'100644'} ${hash}\t${path}\0`);
+      }
+      const lock=join(state.directory,'index.lock');const handle=await open(lock,'wx',0o600);await handle.close();let temporary='';let installed=false;
+      try{
+        if(review.indexDigest&&await this.indexDigest()!==review.indexDigest)throw new Error('暂存区已变化，请重新检查。');
+        temporary=await mkdtemp(join(state.directory,'wudao-stage-'));const index=join(temporary,'index');
+        await copyFile(join(state.directory,'index'),index);await this.run(['update-index','-z','--index-info'],entries.join(''),index);
+        const current=await this.guard();if(current.head!==review.head||current.branch!==review.branch)throw new Error('提交已变化，请重新检查。');
+        await copyFile(index,lock);await rename(lock,join(state.directory,'index'));installed=true;
+      }finally{if(!installed)await rm(lock,{force:true});if(temporary)await rm(temporary,{recursive:true,force:true});}
+    });
+  }
+
+  async unstage(paths: string[]): Promise<void> {
+    return this.exclusive(async () => {
+      await this.ready();
+      await this.guard(); if (!paths.length || paths.some(path => !allowedPath(path))) throw new Error('请选择允许操作的文件。');
+      await this.run(['reset', '-q', 'HEAD', '--', ...paths]);
+    });
   }
 
   async preview(review: Review, path: string): Promise<string> {
+    const current=await this.guard();if(current.head!==review.head||current.branch!==review.branch||review.indexDigest&&await this.indexDigest()!==review.indexDigest)throw new Error('提交或暂存区已变化，请重新检查。');
     const change = review.changes.find(item => item.path === path && item.allowed);
     if (!change) throw new Error('请选择允许查看的文件。');
-    const bytes = await this.readDocument(path);
+    const bytes = review.staged ? await this.indexDocument(path) : await this.readDocument(path);
     if (this.digest(bytes) !== change.digest) throw new Error('文件已变化，请重新检查。');
     if (bytes && (bytes.includes(0) || !['.md', '.txt', '.csv'].includes(extname(path).toLowerCase()))) return '附件仅展示文件名；请在 Obsidian 中打开附件检查内容后再选择提交。';
     const exists = (await this.run(['ls-tree', '-z', review.head, '--', path])).length > 0;
-    const before = exists ? (await this.run(['cat-file', 'blob', `${review.head}:${path}`])).toString('utf8') : '（新文件）';
+    const before = review.staged ? exists ? (await this.run(['cat-file', 'blob', `${review.head}:${path}`])).toString('utf8') : '（新文件）' : (await this.indexDocument(path))?.toString('utf8')??'（新文件）';
     return `变更前\n${before.slice(0, 50_000)}\n\n变更后\n${bytes?.toString('utf8').slice(0, 50_000) ?? '（删除文件）'}\n\n（每部分最多显示 50,000 个字符）`;
   }
 
   async commit(review: Review, selected: string[], message: string): Promise<string> {
     return this.exclusive(async () => {
+      await this.ready();
       if (!selected.length || new Set(selected).size !== selected.length) throw new Error('请选择需要提交的文件。');
       if (!message.trim() || message.length > 1000 || message.includes('\0')) throw new Error('提交说明不能为空，且最多 1000 个字符。');
       if (SECRET.test(message)) throw new Error('提交说明包含疑似令牌或私钥，请移除后重新检查。');
@@ -207,7 +282,7 @@ export class Repository {
       for (const path of selected) {
         const change = review.changes.find(item => item.path === path && item.allowed);
         if (!change) throw new Error('选择包含未审阅或不允许上传的文件。');
-        const bytes = await this.readDocument(path);
+        const bytes = review.staged ? await this.indexDocument(path) : await this.readDocument(path);
         if (this.digest(bytes) !== change.digest) throw new Error('文件已发生变化，请重新检查后提交。');
         totalBytes += bytes?.length ?? 0;
         if (totalBytes > 50 * 1024 * 1024) throw new Error('本次选择超过 50 MiB，请分批提交。');
@@ -220,9 +295,9 @@ export class Repository {
       await handle.close();
       let temporary = '';
       let advanced = false;
-      let installed = false;
       try {
         temporary = await mkdtemp(join(state.directory, 'wudao-index-'));
+        if (review.indexDigest && await this.indexDigest() !== review.indexDigest) throw new Error('暂存区已变化，请重新检查。');
         const index = join(temporary, 'index');
         await this.run(['read-tree', review.head], undefined, index);
         const entries = [];
@@ -236,20 +311,43 @@ export class Repository {
         const current = await this.guard();
         await this.changes();
         if (current.head !== review.head || current.branch !== review.branch) throw new Error('提交已变化，请重新检查。');
-        await copyFile(index, lock);
+        // Keep all unselected staged entries. Only the approved paths advance
+        // to their newly committed versions in the real index.
+        const retained = join(temporary, 'retained');
+        try { await copyFile(join(state.directory, 'index'), retained); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== 'ENOENT') throw error; await this.run(['read-tree', review.head], undefined, retained); }
+        await this.run(['update-index', '-z', '--index-info'], entries.join(''), retained);
+        await copyFile(retained, lock);
         await this.run(['update-ref', '-m', 'Wudao Git: reviewed commit', `refs/heads/${review.branch}`, commit, review.head]);
         advanced = true;
         await rename(lock, join(state.directory, 'index'));
-        installed = true;
         return commit;
       } finally {
-        if (!advanced || installed) await rm(lock, { force: true });
+        if (!advanced) await rm(lock, { force: true });
         if (temporary) await rm(temporary, { recursive: true, force: true });
       }
     });
   }
 
   private tracking(branch: string): string { return `refs/remotes/wudao-git/${branch}`; }
+
+  private synchronizer(): NativeSync {
+    this.sync ??= new NativeSync({ root:this.root, repository:this.repository, url:this.url,
+      run:(...args)=>this.run(...args), transfer:args=>this.transfer(args), guard:()=>this.guard(), indexDigest:()=>this.indexDigest(), read:(path,raw)=>this.readDocument(path,raw,true),indexRead:path=>this.indexDocument(path,true),active:()=>!this.disposed });
+    return this.sync;
+  }
+  async initialized(): Promise<boolean> {
+    try { const stat=await lstat(join(this.root,'.git')); if(!stat.isDirectory()||stat.isSymbolicLink())throw new Error('Git 元数据无效。');return true; }
+    catch(e){if((e as NodeJS.ErrnoException).code==='ENOENT')return false;throw e;}
+  }
+  async recovery(): Promise<boolean> { return this.synchronizer().recovery(); }
+  private async ready():Promise<void>{if(await this.recovery())throw new Error('上次本地同步中断，请先恢复同步。');}
+  async planPull(): Promise<PullPlan> { return this.exclusive(()=>this.synchronizer().planPull()); }
+  async planAttach(branch='main'): Promise<PullPlan> { return this.exclusive(()=>this.synchronizer().planAttach(branch)); }
+  async applyPull(plan:PullPlan,resolutions:Record<string,Resolution>={},confirmation?:Confirmation):Promise<{preserved:string[]}> { return this.exclusive(()=>this.synchronizer().applyPull(plan,resolutions,confirmation)); }
+  async previewPull(plan:PullPlan,path:string):Promise<string> { return this.synchronizer().previewPull(plan,path); }
+  async discardPlan(id:string):Promise<void>{await this.synchronizer().discard(id);}
+  async recover():Promise<{preserved:string[]}> { return this.exclusive(()=>this.synchronizer().recover()); }
 
   protected async transfer(args: string[]): Promise<Buffer> { return this.run(args); }
 
@@ -286,10 +384,9 @@ export class Repository {
     for (const hash of hashes) {
       if (SECRET.test(await this.text(['show', '-s', '--format=%B', hash]))) throw new Error('待同步提交说明包含疑似令牌或私钥，已停止同步。');
       const parents = (await this.text(['rev-list', '--parents', '-n', '1', hash])).split(' ');
-      if (parents.length !== 2) throw new Error('待同步历史包含合并提交，请使用外部 Git 检查。');
-      const files = (await this.run(['diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', parents[1]!, hash])).toString('utf8').split('\0').filter(Boolean);
+      const files = [...new Set((await Promise.all(parents.slice(1).map(parent => this.run(['diff-tree', '--no-commit-id', '--name-only', '--no-renames', '-r', '-z', parent, hash])))).flatMap(bytes => bytes.toString('utf8').split('\0').filter(Boolean)))];
       for (const path of files) {
-        if (!allowedPath(path)) throw new Error('待同步历史包含不允许的文件，请使用外部 Git 检查。');
+        if (!allowedPath(path)&&!nativeMetadata(path)) throw new Error('待同步历史包含不允许的文件，请使用外部 Git 检查。');
         const entry = (await this.run(['ls-tree', '-z', hash, '--', path])).toString('utf8');
         if (!entry) continue;
         if (!entry.startsWith('100644 blob ') && !entry.startsWith('100755 blob ')) throw new Error('待同步历史包含链接或子模块，已停止同步。');
@@ -299,6 +396,42 @@ export class Repository {
       commits.push({ hash, subject: await this.text(['show', '-s', '--format=%s', hash]), files });
     }
     return commits;
+  }
+
+  async history(limit = 20): Promise<{ hash: string; subject: string; date: string }[]> {
+    await this.guard(); if (!Number.isInteger(limit) || limit < 1 || limit > 100) throw new Error('历史数量应为 1 至 100。');
+    const raw = await this.text(['log', `-${limit}`, '--format=%H%x00%s%x00%cI']);
+    return raw ? raw.split('\n').map(line => { const [hash, subject, date] = line.split('\0'); return { hash: hash!, subject: subject!, date: date! }; }) : [];
+  }
+
+  private async historyHash(hash: string): Promise<void> {
+    await this.guard();
+    if (!/^[a-f0-9]{40}$/.test(hash) || !await this.ancestor(hash, await this.text(['rev-parse', 'HEAD']))) throw new Error('请选择当前分支历史中的提交。');
+  }
+
+  async historyFiles(hash: string): Promise<{ path: string; status: string }[]> {
+    await this.historyHash(hash);
+    const parents=(await this.text(['rev-list','--parents','-n','1',hash])).split(' ').slice(1);
+    const raw = (await this.run(['diff-tree', '--root', '--no-commit-id', '--name-status', '--no-renames', '-r', '-z', ...(parents[0]?[parents[0],hash]:[hash])])).toString('utf8').split('\0').filter(Boolean);
+    const files = []; for (let i = 0; i < raw.length; i += 2) files.push({ path: raw[i+1]!, status: raw[i]! });
+    return files;
+  }
+
+  async historyPreview(hash: string, path: string): Promise<string> {
+    const files = await this.historyFiles(hash);
+    if (!files.some(file => file.path === path) || !allowedPath(path)) throw new Error('请选择允许查看的历史文件。');
+    const parents = (await this.text(['rev-list', '--parents', '-n', '1', hash])).split(' ').slice(1);
+    const body = async (commit?: string) => {
+      if (!commit || !(await this.run(['ls-tree', '-z', commit, '--', path])).length) return '（不存在）';
+      const entry = (await this.run(['ls-tree', '-z', commit, '--', path])).toString('utf8');
+      if (!/^100(?:644|755) blob /.test(entry)) throw new Error('历史文件不是普通文档。');
+      const size = Number(await this.text(['cat-file', '-s', `${commit}:${path}`]));
+      if (size > MAX_BYTES) throw new Error('历史文件超过 20 MiB。');
+      const bytes = await this.run(['cat-file', 'blob', `${commit}:${path}`]);
+      if (SECRET.test(bytes.toString('utf8'))) throw new Error('历史文件含疑似凭据，已停止预览。');
+      return bytes.includes(0) || !['.md','.txt','.csv'].includes(extname(path).toLowerCase()) ? `附件：${size} 字节` : bytes.toString('utf8').slice(0,50000);
+    };
+    return `变更前\n${await body(parents[0])}\n\n变更后\n${await body(hash)}`;
   }
 
   async reviewPush(): Promise<PushReview> {
@@ -312,6 +445,7 @@ export class Repository {
 
   async push(review: PushReview): Promise<PushResult> {
     return this.exclusive(async () => {
+      await this.ready();
       const state = await this.guard();
       if (state.head !== review.head || state.branch !== review.branch) throw new Error('本地提交已变化，请重新检查待推送提交。');
       if (await this.fetch(state.branch) !== review.remoteHead) throw new Error('远端已变化，请重新检查待推送提交。');
@@ -326,6 +460,7 @@ export class Repository {
 
   async pull(): Promise<void> {
     return this.exclusive(async () => {
+      await this.ready();
       const state = await this.guard();
       if ((await this.changes()).length) throw new Error('请先提交或处理本地改动，再拉取更新。');
       const remoteHead = await this.fetch(state.branch);

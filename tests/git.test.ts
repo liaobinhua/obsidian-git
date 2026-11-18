@@ -6,6 +6,7 @@ import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promis
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { Repository, allowedPath, safeEnvironment } from '../src/git.ts';
+import { NativeSync, type NativePort } from '../src/native-sync.ts';
 
 const roots: string[] = [];
 const git = (root: string, ...args: string[]) => execFileSync('/usr/bin/git', ['-C', root, ...args], { encoding: 'utf8', stdio: 'pipe', env: { ...process.env, GIT_CONFIG_GLOBAL: '/dev/null', GIT_CONFIG_NOSYSTEM: '1' } });
@@ -64,8 +65,106 @@ async function connected() {
   git(root, 'push', remote, 'main');
   return { root, remote, repo: new LocalRepository(root, remote) };
 }
+function port(repo:LocalRepository):NativePort{
+  const inner=repo as unknown as {run:NativePort['run'];guard:NativePort['guard'];indexDigest:NativePort['indexDigest'];indexDocument:NativePort['indexRead']};
+  return {root:repo.root,repository:repo.repository,url:repo.url,run:(...args)=>inner.run(...args),transfer:args=>repo['transfer'](args),guard:()=>inner.guard(),indexDigest:()=>inner.indexDigest(),read:(path,raw)=>repo.readDocument(path,raw),indexRead:path=>inner.indexDocument(path)};
+}
 
 describe('reviewed synchronization with a real bare Git remote', () => {
+  it('enforces the snapshot budget even when every worktree file already matches the remote',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();const body=Buffer.alloc(9*1024*1024,66);
+    for(let i=0;i<3;i++)await writeFile(join(root,`large-${i}.md`),body);
+    git(root,'add','.');git(root,'commit','-m','Large remote');git(root,'push',remote,'main');git(root,'reset','--hard',base);
+    for(let i=0;i<3;i++)await writeFile(join(root,`large-${i}.md`),body);
+    await assert.rejects(repo.planPull(),/50 MiB/);assert.equal(git(root,'rev-parse','HEAD').trim(),base);
+  });
+  it('replaces and cancels attach previews without retaining their temporary Git directories',async()=>{
+    const {remote}=await connected();const root=await mkdtemp(join(tmpdir(),'wudao-preview-'));roots.push(root);const repo=new LocalRepository(root,remote);
+    const adapter=port(repo);const run=adapter.run;const created:string[]=[];
+    adapter.run=async(...args)=>{if(args[0][0]==='init'&&args[0][1]==='--bare')created.push(args[0][2]!);return run(...args);};
+    const engine=new NativeSync(adapter);const first=await engine.planAttach();const next=await engine.planAttach();
+    await assert.rejects(readFile(join(created[0]!,'HEAD')),error=>(error as NodeJS.ErrnoException).code==='ENOENT');
+    await assert.rejects(engine.applyPull(first),/失效/);await engine.discard(next.id);
+    await assert.rejects(readFile(join(created[1]!,'HEAD')),error=>(error as NodeJS.ErrnoException).code==='ENOENT');
+  });
+  it('rejects index changes arriving after a merge preview without losing the new staged content',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+    await writeFile(join(root,'first.md'),'remote');git(root,'add','.');git(root,'commit','-m','Remote');git(root,'push',remote,'main');git(root,'reset','--hard',base);
+    const adapter=port(repo);const run=adapter.run;let injected=false;
+    adapter.run=async(...args)=>{const result=await run(...args);if(args[0][0]==='write-tree'&&!injected){injected=true;await writeFile(join(root,'first.md'),'late staged');git(root,'add','first.md');}return result;};
+    const engine=new NativeSync(adapter);const plan=await engine.planPull();await assert.rejects(engine.applyPull(plan),/暂存区.*变化/);
+    assert.equal(git(root,'show',':first.md'),'late staged');assert.equal(git(root,'rev-parse','HEAD').trim(),base);
+  });
+  it('recovers a partial write while retaining later bytes and an original worktree backup',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+    await writeFile(join(root,'first.md'),'remote');git(root,'add','.');git(root,'commit','-m','Remote');git(root,'push',remote,'main');git(root,'reset','--hard',base);
+    await writeFile(join(root,'first.md'),'unsaved local original');
+    const adapter=port(repo);const read=adapter.read;let reads=0;
+    adapter.read=async(path,raw)=>{if(raw&&path==='first.md'&&++reads===2){await writeFile(join(root,path),'partial');throw new Error('write interrupted');}return read(path,raw);};
+    const engine=new NativeSync(adapter);const plan=await engine.planPull();await assert.rejects(engine.applyPull(plan,{'first.md':'remote'}),/interrupted/);
+    assert.equal(await engine.recovery(),true);const result=await repo.recover();assert.deepEqual(result.preserved,['first.md']);
+    assert.equal(await readFile(join(root,'first.md'),'utf8'),'partial');assert.equal(await readFile(join(root,'first.recovery-copy.md'),'utf8'),'unsaved local original');assert.equal(await repo.recovery(),false);
+  });
+  it('applies a remote update while retaining unrelated worktree edits and staged bytes', async () => {
+    const {root,remote,repo}=await connected();const start=git(root,'rev-parse','HEAD').trim();
+    await writeFile(join(root,'incoming.md'),'remote');git(root,'add','incoming.md');git(root,'commit','-m','Incoming');git(root,'push',remote,'main');git(root,'reset','--hard',start);
+    await writeFile(join(root,'first.md'),'staged local');git(root,'add','first.md');await writeFile(join(root,'first.md'),'later local');
+    const plan=await repo.planPull();assert.equal(plan.changes[0]?.path,'incoming.md');await repo.applyPull(plan);
+    assert.equal(await readFile(join(root,'incoming.md'),'utf8'),'remote');assert.equal(await readFile(join(root,'first.md'),'utf8'),'later local');assert.equal(git(root,'show',':first.md'),'staged local');
+  });
+  it('merges divergent histories using two real parents and can push the reviewed merge',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+    await writeFile(join(root,'remote.md'),'remote');git(root,'add','.');git(root,'commit','-m','Remote');git(root,'push',remote,'main');const incoming=git(root,'rev-parse','HEAD').trim();git(root,'reset','--hard',base);
+    await writeFile(join(root,'local.md'),'local');git(root,'add','.');git(root,'commit','-m','Local');const local=git(root,'rev-parse','HEAD').trim();
+    await repo.applyPull(await repo.planPull());assert.equal(git(root,'show','HEAD:local.md'),'local');assert.equal(git(root,'show','HEAD:remote.md'),'remote');
+    assert.deepEqual(git(root,'rev-list','--parents','-n','1','HEAD').trim().split(' ').slice(1),[local,incoming]);
+    assert.deepEqual(await repo.historyFiles(git(root,'rev-parse','HEAD').trim()),[{path:'remote.md',status:'A'}]);
+    await repo.push(await repo.reviewPush());assert.equal(git(remote,'rev-parse','main'),git(root,'rev-parse','HEAD'));
+  });
+  it('advances the Git baseline when the worktree already equals a remote update or deletion',async()=>{
+    for(const deleted of [false,true]){
+      const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+      if(deleted)git(root,'rm','first.md');else await writeFile(join(root,'first.md'),'remote');
+      git(root,'add','.');git(root,'commit','-m','Remote');git(root,'push',remote,'main');const target=git(root,'rev-parse','HEAD').trim();git(root,'reset','--hard',base);
+      if(deleted)await rm(join(root,'first.md'));else await writeFile(join(root,'first.md'),'remote');
+      const plan=await repo.planPull();await repo.applyPull(plan);assert.equal(git(root,'rev-parse','HEAD').trim(),target);assert.equal(git(root,'status','--porcelain'),'');
+    }
+  });
+  it('stops excluded remote changes instead of creating a merge that silently discards them',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+    await writeFile(join(root,'unsupported.docx'),'document');git(root,'add','.');git(root,'commit','-m','Unsupported');git(root,'push',remote,'main');git(root,'reset','--hard',base);
+    await assert.rejects(repo.planPull(),/排除文件/);assert.equal(git(root,'rev-parse','HEAD').trim(),base);assert.equal(git(root,'status','--porcelain'),'');
+  });
+  it('preserves remote Git placeholder metadata and independent staged and worktree conflict copies',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+    await mkdir(join(root,'empty'));await writeFile(join(root,'empty/.gitkeep'),'');await writeFile(join(root,'first.md'),'remote');git(root,'add','.');git(root,'commit','-m','Remote');git(root,'push',remote,'main');git(root,'reset','--hard',base);
+    await writeFile(join(root,'first.md'),'unique staged');git(root,'add','first.md');await writeFile(join(root,'first.md'),'unique worktree');
+    await repo.applyPull(await repo.planPull(),{'first.md':'both'});
+    assert.equal(await readFile(join(root,'first.local-copy.md'),'utf8'),'unique worktree');assert.equal(await readFile(join(root,'first.staged-copy.md'),'utf8'),'unique staged');
+    assert.equal(git(root,'show','HEAD:empty/.gitkeep'),'');assert.equal(await readFile(join(root,'empty/.gitkeep'),'utf8'),'');
+  });
+  it('requires a conflict choice before modifying a path with a distinct staged version',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+    await writeFile(join(root,'first.md'),'remote');git(root,'add','.');git(root,'commit','-m','Remote');git(root,'push',remote,'main');git(root,'reset','--hard',base);
+    await writeFile(join(root,'first.md'),'staged');git(root,'add','first.md');await writeFile(join(root,'first.md'),'remote');
+    const plan=await repo.planPull();assert.equal(plan.changes[0]?.kind,'conflict');assert.match(await repo.previewPull(plan,'first.md'),/staged/);
+    await repo.applyPull(plan,{'first.md':'local'});assert.equal(git(root,'show',':first.md'),'staged');assert.equal(await readFile(join(root,'first.md'),'utf8'),'remote');
+  });
+  it('requires conflict choices and keeps a local copy when applying both versions',async()=>{
+    const {root,remote,repo}=await connected();const base=git(root,'rev-parse','HEAD').trim();
+    await writeFile(join(root,'first.md'),'remote');git(root,'add','.');git(root,'commit','-m','Remote');git(root,'push',remote,'main');git(root,'reset','--hard',base);
+    await writeFile(join(root,'first.md'),'local');git(root,'add','.');git(root,'commit','-m','Local');
+    const plan=await repo.planPull();assert.equal(plan.changes[0]?.kind,'conflict');await assert.rejects(repo.applyPull(plan),/冲突/);
+    await repo.applyPull(plan,{'first.md':'both'});assert.equal(await readFile(join(root,'first.md'),'utf8'),'remote');assert.equal(await readFile(join(root,'first.local-copy.md'),'utf8'),'local');
+  });
+  it('attaches an existing nonempty directory without deleting local-only notes',async()=>{
+    const {remote}=await connected();const root=await mkdtemp(join(tmpdir(),'wudao-existing-'));roots.push(root);
+    await writeFile(join(root,'first.md'),'my original');await writeFile(join(root,'local.md'),'local only');const repo=new LocalRepository(root,remote);
+    const plan=await repo.planAttach();assert.equal(plan.initial,true);assert.equal(await repo.initialized(),false);
+    await repo.applyPull(plan,{'first.md':'local'});assert.equal(await repo.initialized(),true);
+    assert.equal(await readFile(join(root,'first.md'),'utf8'),'my original');assert.equal(await readFile(join(root,'local.md'),'utf8'),'local only');
+    assert.equal((await repo.review()).changes.length,2);assert.equal(git(remote,'rev-list','--count','main').trim(),'1');
+  });
   it('reviews outgoing commits and pushes the exact approved commit', async () => {
     const { root, remote, repo } = await connected();
     await writeFile(join(root, 'new.md'), 'new');
@@ -176,6 +275,11 @@ describe('reviewed synchronization with a real bare Git remote', () => {
 });
 
 describe('review and commit using real Git', () => {
+  it('compares worktree against the staged index and staged changes against HEAD',async()=>{
+    const {root,repo}=await fixture();await writeFile(join(root,'first.md'),'B');git(root,'add','first.md');await writeFile(join(root,'first.md'),'C');
+    assert.match(await repo.preview(await repo.review(),'first.md'),/变更前\nB\n\n变更后\nC/);
+    assert.match(await repo.preview(await repo.reviewStaged(),'first.md'),/变更前\n# First\n\n\n变更后\nB/);
+  });
   it('lists changes without staging and commits only selected files', async () => {
     const { root, repo } = await fixture();
     await writeFile(join(root, 'first.md'), '# Revised\n');
@@ -206,12 +310,40 @@ describe('review and commit using real Git', () => {
     await assert.rejects(repo.commit(review, ['first.md'], 'Update'), /变化|重新/);
     assert.equal(git(root, 'rev-parse', 'HEAD'), before);
   });
-  it('rejects pre-staged files instead of mixing them into a commit', async () => {
+  it('preserves existing staging and commits its reviewed snapshot even after later edits', async () => {
     const { root, repo } = await fixture();
     await writeFile(join(root, 'first.md'), 'staged');
     git(root, 'add', '.');
-    await assert.rejects(repo.review(), /暂存/);
+    const review = await repo.reviewStaged();
+    await writeFile(join(root, 'first.md'), 'later work');
+    await repo.commit(review, ['first.md'], 'Staged snapshot');
+    assert.equal(git(root, 'show', 'HEAD:first.md'), 'staged');
+    assert.equal(await readFile(join(root, 'first.md'), 'utf8'), 'later work');
+    assert.equal(git(root, 'diff', '--cached', '--name-only'), '');
+  });
+  it('commits selected worktree files without losing another staged file', async () => {
+    const { root, repo } = await fixture();
+    await writeFile(join(root, 'first.md'), 'staged'); git(root, 'add', 'first.md');
+    await writeFile(join(root, 'other.md'), 'selected');
+    await repo.commit(await repo.review(), ['other.md'], 'Only other');
     assert.equal(git(root, 'diff', '--cached', '--name-only').trim(), 'first.md');
+    assert.equal(git(root, 'show', ':first.md'), 'staged');
+    assert.equal(git(root, 'show', 'HEAD:first.md'), '# First\n');
+  });
+  it('stages and unstages a reviewed file without changing its working content', async () => {
+    const { root, repo } = await fixture(); await writeFile(join(root, 'first.md'), 'snapshot');
+    await repo.stage(await repo.review(), ['first.md']);
+    assert.equal(git(root, 'show', ':first.md'), 'snapshot');
+    await repo.unstage(['first.md']);
+    assert.equal(git(root, 'diff', '--cached', '--name-only'), '');
+    assert.equal(await readFile(join(root, 'first.md'), 'utf8'), 'snapshot');
+  });
+  it('reads real history and file differences without changing the repository', async () => {
+    const { root, repo } = await fixture(); const head = git(root, 'rev-parse', 'HEAD').trim();
+    const history = await repo.history(); assert.equal(history[0]?.hash, head);
+    assert.deepEqual(await repo.historyFiles(head), [{ path: 'first.md', status: 'A' }]);
+    assert.match(await repo.historyPreview(head, 'first.md'), /First/);
+    assert.equal(git(root, 'status', '--porcelain'), '');
   });
   it('lists forbidden files but refuses their selection', async () => {
     const { root, repo } = await fixture();

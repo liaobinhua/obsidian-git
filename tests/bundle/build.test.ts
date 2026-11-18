@@ -24,7 +24,14 @@ test('Android artifact has no native Node imports and starts without process, Bu
   class TextFileView { async save() { saved++; } }
   class Plugin {
     app = {
-      vault: { adapter: { stat: async () => null }, configDir: '.obsidian' },
+      vault: { adapter: (()=>{
+        const files=new Map<string,string>();const folders=new Set<string>();return {
+          stat:async(path:string)=>files.has(path)?{type:'file',size:files.get(path)!.length}:folders.has(path)?{type:'folder',size:0}:null,
+          mkdir:async(path:string)=>{folders.add(path);},list:async()=>({files:[],folders:[]}),read:async(path:string)=>files.get(path)!,
+          write:async(path:string,text:string)=>{if(failSave)throw new Error('disk unavailable');files.set(path,text);const entry=JSON.parse(text) as {payload?:string};if(entry.payload)persisted=JSON.parse(entry.payload);},
+          rename:async(from:string,to:string)=>{files.set(to,files.get(from)!);files.delete(from);},remove:async(path:string)=>{files.delete(path);},
+        };
+      })(), configDir: '.obsidian' },
       workspace: { iterateAllLeaves(callback: (leaf: { view: object }) => void) { views.forEach(callback); } },
       secretStorage: { getSecret() { return 'fixture-only'; } },
     };
@@ -35,12 +42,13 @@ test('Android artifact has no native Node imports and starts without process, Bu
     addSettingTab() {}
     addRibbonIcon() {}
     addCommand(command: { id: string; callback: () => void }) { commands.push(command); }
+    registerView() {}
   }
   class PluginSettingTab { constructor(..._args: unknown[]) {} }
   class Notice { constructor(..._args: unknown[]) {} hide() {} }
   let opened = 0;
   class Modal { contentEl = { empty() {} }; open() { opened++; } close() {} }
-  const sdk = { Plugin, PluginSettingTab, Notice, Platform: { isAndroidApp: true }, Modal, Setting: class {}, SecretComponent: class {}, TFile: class {}, TextFileView };
+  const sdk = { Plugin, ItemView:class {}, PluginSettingTab, Notice, Platform: { isAndroidApp: true }, Modal, Setting: class {}, SecretComponent: class {}, TFile: class {}, TextFileView };
   let networkCalls = 0;
   runInNewContext(script, {
     module, exports: module.exports,
@@ -51,7 +59,7 @@ test('Android artifact has no native Node imports and starts without process, Bu
   assert.ok(module.exports.default);
   const plugin = new module.exports.default(); await plugin.onload();
   assert.equal(plugin.settings.uploadEnabled, false);
-  assert.deepEqual(commands.map(c => c.id), ['download', 'review-changes', 'recover']);
+  assert.deepEqual(commands.map(c => c.id), ['source-control','attach','repair','download', 'review-changes', 'recover']);
   assert.equal(networkCalls, 0);
   plugin.onunload();
   views.push({ view: new TextFileView() });
@@ -83,7 +91,7 @@ test('Android artifact has no native Node imports and starts without process, Bu
   for (const method of ['showChanges', 'showPull', 'recover'] as const) {
     const active = new module.exports.default(); await active.onload();
     active.settings.secretName = 'fixture';
-    const ready = { review: async () => review, planPull: async () => plan, recover: async () => recovery };
+    const ready = { inspectVault:async()=>({initialized:true}),review: async () => review, planPull: async () => plan, recover: async () => recovery };
     active.repository = () => ready;
     active.store = () => ({ load: async () => ({ pending: { files: {} }, draft: { review } }) });
     const before = opened;
@@ -94,7 +102,7 @@ test('Android artifact has no native Node imports and starts without process, Bu
     waiting.settings.secretName = 'fixture';
     let complete!: (value: unknown) => void;
     const deferred = new Promise<unknown>(resolve => { complete = resolve; });
-    const pending = { review: () => deferred, planPull: () => deferred, recover: () => deferred };
+    const pending = { inspectVault:async()=>({initialized:true}),review: () => deferred, planPull: () => deferred, recover: () => deferred };
     waiting.repository = () => pending;
     waiting.store = () => ({ load: async () => ({ pending: { files: {} }, draft: { review } }) });
     const operation = waiting[method](); waiting.onunload();

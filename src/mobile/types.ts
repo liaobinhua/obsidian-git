@@ -25,7 +25,11 @@ export type RequestPort = (options: RequestOptions) => Promise<{
 export interface MobileChange {
   path: string; status: 'add' | 'modify' | 'delete'; digest: string; allowed: boolean; reason: string;
 }
-export interface MobileReview { id: string; head: string; changes: MobileChange[] }
+export interface MobileReview {
+  id: string; head: string; changes: MobileChange[];
+  /** Working-tree reviews bind to this staged review id; empty means an empty index delta. */
+  index?: string;
+}
 export interface PullChange {
   path: string;
   kind: 'remote' | 'local' | 'conflict' | 'same';
@@ -34,9 +38,12 @@ export interface PullChange {
 export interface ExcludedRemoteFile { path: string; reason: string }
 export interface PullPlan {
   id: string; head: string; initial: boolean; changes: PullChange[]; deletions: string[];
+  /** Explicitly reviewed connection of an existing, nonempty vault. */
+  attach?: boolean;
   /** Missing safe directories to create; existing local directories are never deleted. */
   directories: string[];
-  summary: { remoteFiles: number; managedFiles: number; remoteDirectories: number; excluded: ExcludedRemoteFile[] };
+  summary: { remoteFiles: number; managedFiles: number; remoteDirectories: number; excluded: ExcludedRemoteFile[]; metadataFiles?:number };
+  integration?:boolean;
 }
 export interface ApplyPullResult { preserved: string[] }
 export type Resolution = 'local' | 'remote' | 'both';
@@ -44,6 +51,16 @@ export interface Confirmation { deletions: string[]; bulkDelete: boolean }
 export interface ApplyEntry { path: string; before: string | null; after: string | null }
 export interface BaselineFile { sha: string; size: number }
 export interface PendingUpload { commit: string; parent: string; files: Record<string, BaselineFile | null> }
+export interface MobileInspection {
+  repository: string; branch: string; head: string; initialized: boolean; recovery: boolean; pendingUpload: boolean;
+  /** Baseline-relative changes retained for legacy callers. */
+  changes: MobileChange[];
+  /** Working tree compared with the staged snapshot, or baseline for unstaged paths. */
+  workingChanges: MobileChange[];
+  staged: MobileReview | null;
+}
+export interface HistoryEntry { hash: string; subject: string; date: string }
+export interface HistoryFile { path: string; status: 'add' | 'modify' | 'delete' }
 export interface MobileState {
   version: 1;
   repository: string;
@@ -52,6 +69,8 @@ export interface MobileState {
   /** Git blob identity and size only. Whole-vault bodies are never persisted. */
   baseline: Record<string, BaselineFile>;
   draft?: { review: MobileReview; files: Record<string, string | null> };
+  /** Reviewed upload snapshots survive later worktree edits and application restarts. */
+  staged?: { review: MobileReview; files: Record<string, string | null> };
   pending?: PendingUpload;
   journal?: {
     head: string; baseline: Record<string, BaselineFile>; entries: ApplyEntry[];
@@ -67,4 +86,8 @@ export interface StateStore {
    * Resolve only after read-back verification; load must recover the latest valid slot.
    */
   save(state: MobileState): Promise<void>;
+  /** Read-only fingerprint of records that an explicit repair would replace. */
+  prepareRepair?(repository?: string, branch?: string): Promise<string>;
+  /** Preserve raw records before replacing them; reject changes since prepareRepair. */
+  repair?(expected: string, state: MobileState): Promise<void>;
 }

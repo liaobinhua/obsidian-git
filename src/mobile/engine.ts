@@ -1,10 +1,10 @@
-import { GitHubClient, type RemoteTree } from './github.ts';
-import type { ApplyEntry, ApplyPullResult, BaselineFile, Confirmation, LocalFiles, MobileChange, MobileReview, MobileState, PullPlan, Resolution, StateStore } from './types.ts';
+import { GitHubClient, GitHubError, type RemoteTree } from './github.ts';
+import type { ApplyEntry, ApplyPullResult, BaselineFile, Confirmation, HistoryEntry, HistoryFile, LocalFiles, MobileChange, MobileInspection, MobileReview, MobileState, PullPlan, Resolution, StateStore } from './types.ts';
 import { allowedDirectory, allowedPath, binding, blobSha, budget, checkBytes, checkPaths, checkSecret, fromBase64, MAX_FILE_BYTES, object, sha, toBase64, validSha } from './policy.ts';
 
 type Snapshot = Record<string, BaselineFile>;
 interface Scan { files: Snapshot; blocked: MobileChange[]; visible: string[]; paths: string[]; directories: string[] }
-interface StoredPlan { plan: PullPlan; remote: RemoteTree; local: Snapshot; entries: ApplyEntry[]; base: Snapshot; baseHead: string }
+interface StoredPlan { plan: PullPlan; remote: RemoteTree; local: Snapshot; entries: ApplyEntry[]; base: Snapshot; baseHead: string; repair?: string }
 const deleted = 'deleted';
 const identity = (file: BaselineFile | undefined) => file?.sha ?? deleted;
 const keys = (...maps: object[]) => [...new Set(maps.flatMap(map => Object.keys(map)))].sort();
@@ -53,13 +53,15 @@ export class MobileEngine {
     if (loaded.head !== '') sha(loaded.head);
     this.baseline(loaded.baseline);
     if (!loaded.head && Object.keys(loaded.baseline).length) throw new Error('未初始化的同步基线状态无效。');
-    if (loaded.draft) {
-      this.bodies(loaded.draft.files);
-      const review = object(loaded.draft.review);
-      if (typeof review.id !== 'string' || review.head !== loaded.head || !Array.isArray(review.changes)) throw new Error('审阅状态无效。');
-      for (const change of loaded.draft.review.changes) {
+    for (const [name, snapshot] of [['draft', loaded.draft], ['staged', loaded.staged]] as const) if (snapshot) {
+      this.bodies(snapshot.files);
+      const review = object(snapshot.review);
+      if (typeof review.id !== 'string' || !validSha(review.head) || name === 'draft' && review.head !== loaded.head || !Array.isArray(review.changes)
+        || 'index' in review && typeof review.index !== 'string') throw new Error('审阅状态无效。');
+      checkPaths(snapshot.review.changes.map(change => change.path));
+      for (const change of snapshot.review.changes) {
         if (typeof change.path !== 'string' || typeof change.allowed !== 'boolean' || typeof change.reason !== 'string' || !['add', 'modify', 'delete'].includes(change.status)) throw new Error('审阅状态无效。');
-        if (change.allowed && (!allowedPath(change.path) || !(change.path in loaded.draft.files) || change.digest !== deleted && !validSha(change.digest))) throw new Error('审阅快照无效。');
+        if (change.allowed && (!allowedPath(change.path) || !(change.path in snapshot.files) || change.digest !== deleted && !validSha(change.digest))) throw new Error('审阅快照无效。');
       }
     }
     if (loaded.pending) {
@@ -133,40 +135,159 @@ export class MobileEngine {
   async status(): Promise<{ initialized: boolean; recovery: boolean; pendingUpload: boolean }> {
     return this.exclusive(async () => { const state = await this.state(); return { initialized: !!state.head, recovery: !!state.journal, pendingUpload: !!state.pending }; });
   }
-  async review(): Promise<MobileReview> {
+  private changes(state: MobileState, scan: Scan): MobileChange[] {
+    return [...scan.blocked, ...keys(state.baseline, scan.files).filter(path => !scan.blocked.some(change => change.path === path)
+      && identity(state.baseline[path]) !== identity(scan.files[path])).map(path => ({
+      path, status: !scan.files[path] ? 'delete' as const : state.baseline[path] ? 'modify' as const : 'add' as const,
+      digest: identity(scan.files[path]), allowed: true, reason: '',
+    }))].sort((a,b) => a.path.localeCompare(b.path));
+  }
+  private async workingChanges(state: MobileState, scan: Scan): Promise<MobileChange[]> {
+    const baseline = { ...state.baseline };
+    for (const [path, body] of Object.entries(state.staged?.files ?? {})) {
+      if (body === null) { delete baseline[path]; continue; }
+      const bytes = fromBase64(body); baseline[path] = { sha: await blobSha(bytes), size: bytes.length };
+    }
+    return this.changes({ ...state, baseline }, scan);
+  }
+  async inspectVault(): Promise<MobileInspection> {
+    return this.exclusive(async () => {
+      const state = await this.state(); const scan = await this.scan();
+      return { repository: this.repository, branch: this.branch, head: state.head, initialized: !!state.head,
+        recovery: !!state.journal, pendingUpload: !!state.pending, changes: this.changes(state, scan),
+        workingChanges: await this.workingChanges(state, scan), staged: clone(state.staged?.review ?? null) };
+    });
+  }
+  async review(): Promise<MobileReview> { return this.createReview(false); }
+  async reviewWorking(): Promise<MobileReview> { return this.createReview(true); }
+  private async createReview(working: boolean): Promise<MobileReview> {
     return this.exclusive(async () => {
       const state = await this.state(); this.ready(state);
-      if (!state.head) throw new Error('请先将 GitHub 分支导入空文库。');
+      if (!state.head) throw new Error('请先连接现有文库，或检查远端并建立同步关系。');
       if (state.pending) throw new Error('上次上传结果待核对，请先重试上传或恢复。');
       const scan = await this.scan();
-      const changes = [...scan.blocked];
+      const changes = working ? await this.workingChanges(state, scan) : this.changes(state, scan);
       const snapshots: Record<string, string | null> = Object.create(null) as Record<string, string | null>;
       let size = 0;
-      for (const path of keys(state.baseline, scan.files)) {
-        if (scan.blocked.some(change => change.path === path) || identity(state.baseline[path]) === identity(scan.files[path])) continue;
+      for (const change of changes) {
+        if (!change.allowed) continue;
+        const path = change.path;
         size += scan.files[path]?.size ?? 0; budget(size);
         snapshots[path] = await this.snapshot(path, scan.files[path]);
-        changes.push({ path, status: !scan.files[path] ? 'delete' : state.baseline[path] ? 'modify' : 'add', digest: identity(scan.files[path]), allowed: true, reason: '' });
       }
-      const review = { id: crypto.randomUUID(), head: state.head, changes: changes.sort((a,b) => a.path.localeCompare(b.path)) };
+      const review: MobileReview = { id: crypto.randomUUID(), head: state.head, changes: changes.sort((a,b) => a.path.localeCompare(b.path)),
+        ...(working ? { index: state.staged?.review.id ?? '' } : {}) };
       state.draft = { review, files: snapshots };
       await this.store.save(state);
       return clone(review);
     });
   }
   private draft(state: MobileState, review: MobileReview) {
-    if (!state.draft || state.draft.review.id !== review.id || state.draft.review.head !== state.head) throw new Error('审阅已失效，请重新检查。');
-    return state.draft;
+    const draft = state.staged?.review.id === review.id ? state.staged : state.draft;
+    if (!draft || draft.review.id !== review.id || draft.review.head !== state.head) throw new Error('审阅或暂存基线已失效，请重新检查；原暂存快照仍保留。');
+    if (draft.review.index !== undefined && draft.review.index !== (state.staged?.review.id ?? '')) throw new Error('暂存区在审阅后发生变化，请重新检查工作区。');
+    return draft;
   }
-  async preview(review: MobileReview, path: string): Promise<string> {
+  async stage(review: MobileReview, selected: string[]): Promise<MobileReview> {
+    return this.exclusive(async () => {
+      const state = await this.state(); this.ready(state);
+      if (state.pending) throw new Error('请先核对上次上传。');
+      const draft = this.draft(state, review);
+      if (!selected.length || new Set(selected).size !== selected.length) throw new Error('请选择需要暂存的文件。');
+      if (state.staged && state.staged.review.head !== state.head) throw new Error('暂存基线已变化，请先取消原暂存再重新选择；本地文件不会删除。');
+      const files = clone(state.staged?.files ?? {});
+      for (const path of selected) {
+        const change = draft.review.changes.find(change => change.path === path && change.allowed);
+        if (!change) throw new Error('选择包含未审阅或不允许的文件。');
+        if (draft !== state.staged) await this.snapshot(path, change.digest === deleted ? undefined : { sha: change.digest, size: 0 });
+        const body = draft.files[path];
+        if (body === undefined || (body === null ? deleted : await blobSha(fromBase64(body))) !== change.digest) throw new Error('暂存快照校验失败。');
+        files[path] = body;
+      }
+      this.bodies(files);
+      const changes: MobileChange[] = [];
+      for (const [path, body] of Object.entries(files)) {
+        const digest = body === null ? deleted : await blobSha(fromBase64(body));
+        if (digest === identity(state.baseline[path])) { delete files[path]; continue; }
+        changes.push({ path, status: body === null ? 'delete' : state.baseline[path] ? 'modify' : 'add', digest, allowed: true, reason: '' });
+      }
+      const staged = { id: crypto.randomUUID(), head: state.head, changes: changes.sort((a,b) => a.path.localeCompare(b.path)) };
+      if (changes.length) state.staged = { review: staged, files };
+      else delete state.staged;
+      await this.store.save(state); return clone(staged);
+    });
+  }
+  async unstage(paths: string[]): Promise<void> {
+    return this.exclusive(async () => {
+      const state = await this.state(); this.ready(state);
+      if (state.pending) throw new Error('请先核对上次上传。');
+      if (!state.staged) return;
+      if (paths.some(path => !state.staged!.review.changes.some(change => change.path === path))) throw new Error('取消暂存的文件不在当前选择中。');
+      for (const path of paths) delete state.staged.files[path];
+      state.staged.review.changes = state.staged.review.changes.filter(change => !paths.includes(change.path));
+      state.staged.review.id = crypto.randomUUID();
+      if (!state.staged.review.changes.length) delete state.staged;
+      await this.store.save(state);
+    });
+  }
+  async history(limit = 20): Promise<HistoryEntry[]> {
+    return this.exclusive(async () => {
+      if (!Number.isSafeInteger(limit) || limit < 1 || limit > 50) throw new Error('历史条数必须为 1 到 50。');
+      const result: HistoryEntry[] = []; const seen = new Set<string>(); let current: string | undefined = await this.client.head();
+      while (current && result.length < limit) {
+        if (seen.has(current)) throw new Error('GitHub 提交历史包含循环。');
+        seen.add(current); const entry = await this.client.commit(current);
+        result.push({ hash: entry.hash, subject: entry.subject, date: entry.date }); current = entry.parents[0];
+      }
+      return result;
+    });
+  }
+  private async historyTrees(id: string) {
+    const commit = await this.client.commit(sha(id));
+    const after = await this.client.snapshot(commit.hash);
+    const before = commit.parents[0] ? await this.client.snapshot(commit.parents[0]) : null;
+    return { after, before };
+  }
+  async historyFiles(id: string): Promise<HistoryFile[]> {
+    return this.exclusive(async () => {
+      const { after, before } = await this.historyTrees(id);
+      const incoming = after.leafShas ?? {}; const previous = before?.leafShas ?? {};
+      return keys(incoming, previous).filter(path => incoming[path] !== previous[path])
+        .map(path => ({ path, status: !incoming[path] ? 'delete' : !previous[path] ? 'add' : 'modify' }));
+    });
+  }
+  async historyPreview(id: string, path: string): Promise<string> {
+    return this.exclusive(async () => {
+      if (!allowedPath(path)) throw new Error('此历史文件不在允许查看范围。');
+      const { after, before } = await this.historyTrees(id); const previous = before?.files[path]; const current = after.files[path];
+      if (identity(previous) === identity(current)) throw new Error('此文件不在该提交的变化中。');
+      budget((previous?.size ?? 0) + (current?.size ?? 0));
+      return `提交 ${sha(id)}\n提交前\n${this.display(path, previous ? await this.remoteBody(path, previous) : null)}\n\n提交后\n${this.display(path, current ? await this.remoteBody(path, current) : null)}`;
+    });
+  }
+  async preview(review: MobileReview, path: string, options: { remote?: boolean } = {}): Promise<string> {
     return this.exclusive(async () => {
       const state = await this.state(); this.ready(state);
       const draft = this.draft(state, review);
       const change = draft.review.changes.find(change => change.path === path && change.allowed);
       if (!change) throw new Error('请选择允许预览的已审阅文件。');
-      const bytes = await this.read(path);
-      if ((bytes === null ? deleted : await blobSha(bytes)) !== change.digest) throw new Error('文件已变化，请重新检查。');
-      return `基线：${state.baseline[path]?.sha ?? '新文件'}；离线预览仅显示当前快照。\n当前内容\n${this.display(path, draft.files[path] ?? null)}`;
+      if (draft !== state.staged) {
+        const bytes = await this.read(path);
+        if ((bytes === null ? deleted : await blobSha(bytes)) !== change.digest) throw new Error('文件已变化，请重新检查。');
+      }
+      let before = '（新文件，无基线正文）';
+      const file = state.baseline[path];
+      let label = file?.sha ?? '新文件';
+      if (draft.review.index !== undefined && state.staged && path in state.staged.files) {
+        before = this.display(path,state.staged.files[path]!); label = '暂存区';
+      } else if (file) {
+        before = '（基线正文未缓存，联网查看差异时可读取）';
+        if (options.remote) {
+          try { before = this.display(path, toBase64(await this.client.blob(file))); }
+          catch (error) { if (!(error instanceof GitHubError) || error.status !== 0) throw error; before = '（基线正文未缓存，请联网后查看差异）'; }
+        }
+      }
+      return `基线：${label}\n${before}\n\n${draft === state.staged ? '已暂存快照' : '当前快照'}\n${this.display(path, draft.files[path] ?? null)}`;
     });
   }
   private display(path: string, body: string | null): string {
@@ -175,21 +296,31 @@ export class MobileEngine {
     if (!/\.(md|txt|csv)$/i.test(path) || bytes.includes(0)) return `附件：${bytes.length} 字节；请在 Obsidian 打开检查。`;
     return new TextDecoder().decode(bytes).slice(0, 50000);
   }
-  async planPull(): Promise<PullPlan> {
+  async planPull(): Promise<PullPlan> { return this.plan(false); }
+  async planAttach(options: { repair?: boolean } = {}): Promise<PullPlan> { return this.plan(true, options.repair === true); }
+  private async plan(attach: boolean, repair = false): Promise<PullPlan> {
     return this.exclusive(async () => {
-      const state = await this.state(); this.ready(state);
+      let state: MobileState; let token: string | undefined;
+      try { state = await this.state(); }
+      catch (error) {
+        if (!attach || !repair || !this.store.prepareRepair || !this.store.repair) throw error;
+        token = await this.store.prepareRepair(this.repository, this.branch);
+        state = { version: 1, repository: this.repository, branch: this.branch, head: '', baseline: {} };
+      }
+      this.ready(state);
+      if (attach && state.head) throw new Error('当前同步记录有效，请直接检查远端更新。');
       if (state.pending) {
         if (await this.client.head() === state.pending.commit) await this.finishUpload(state, false);
         else { delete state.pending; await this.store.save(state); }
       }
       const local = await this.scan();
-      if (!state.head && local.visible.length) throw new Error('首次导入仅允许空文档文库（empty vault）。');
+      if (!attach && !state.head && local.visible.length) throw new Error('当前文库已有文档，请使用“连接现有文库”；首次导入仅允许空文档文库（empty vault）。');
       const blocked = local.blocked.find(change => allowedPath(change.path));
       if (blocked) throw new Error(`本地文件 ${blocked.path} 无法安全读取，请先检查。`);
       const remote = await this.client.snapshot();
       checkPaths([...new Set([...local.paths, ...remote.paths])], [...new Set([...local.directories, ...remote.directories])]);
       const plan: PullPlan = {
-        id: crypto.randomUUID(), head: remote.head, initial: !state.head, changes: [], deletions: [],
+        id: crypto.randomUUID(), head: remote.head, initial: !state.head, changes: [], deletions: [], ...(attach ? { attach: true } : {}),
         directories: remote.directories.filter(path => allowedDirectory(path) && !local.directories.includes(path)).sort((a,b) => a.split('/').length - b.split('/').length || a.localeCompare(b)),
         summary: { remoteFiles: remote.totalFiles, managedFiles: Object.keys(remote.files).length, remoteDirectories: remote.totalDirectories, excluded: clone(remote.excluded) },
       };
@@ -209,9 +340,13 @@ export class MobileEngine {
         }
       }
       this.plans.clear();
-      this.plans.set(plan.id, { plan: clone(plan), remote, local: local.files, entries, base: state.baseline, baseHead: state.head });
+      this.plans.set(plan.id, { plan: clone(plan), remote, local: local.files, entries, base: state.baseline, baseHead: state.head, ...(token ? { repair: token } : {}) });
       return plan;
     });
+  }
+  async applyAttach(plan: PullPlan, resolutions: Record<string, Resolution> = {}, confirmation?: Confirmation): Promise<ApplyPullResult> {
+    if (!this.plans.get(plan.id)?.plan.attach) throw new Error('请先检查连接现有文库的计划。');
+    return this.applyPull(plan, resolutions, confirmation);
   }
   async previewPull(plan: PullPlan, path: string): Promise<string> {
     return this.exclusive(async () => {
@@ -234,14 +369,19 @@ export class MobileEngine {
   }
   async applyPull(plan: PullPlan, resolutions: Record<string, Resolution> = {}, confirmation?: Confirmation): Promise<ApplyPullResult> {
     return this.exclusive(async () => {
-      const state = await this.state(); this.ready(state);
       const stored = this.plans.get(plan.id);
+      let state: MobileState;
+      if (stored?.repair) {
+        if (!this.store.prepareRepair || !this.store.repair || await this.store.prepareRepair(this.repository, this.branch) !== stored.repair) throw new Error('待修复记录已变化，请重新检查。');
+        state = { version: 1, repository: this.repository, branch: this.branch, head: '', baseline: {} };
+      } else state = await this.state();
+      this.ready(state);
       if (!stored || state.head !== stored.baseHead || !sameSnapshot(state.baseline, stored.base)) throw new Error('下载审阅已失效，请重新检查。');
       if (state.pending) throw new Error('请先核对上次上传。');
       for (const change of stored.plan.changes) if (change.kind === 'conflict' && !['local', 'remote', 'both'].includes(resolutions[change.path] ?? '')) throw new Error('存在冲突（conflict），请逐个选择本地、远端或两者。');
       const local = await this.scan();
       checkPaths([...new Set([...local.paths, ...stored.remote.paths])], [...new Set([...local.directories, ...stored.remote.directories])]);
-      if (stored.plan.initial && local.visible.length || local.blocked.some(change => allowedPath(change.path)) || !sameSnapshot(local.files, stored.local)) throw new Error('本地文件已变化，请重新检查。');
+      if (stored.plan.initial && !stored.plan.attach && local.visible.length || local.blocked.some(change => allowedPath(change.path)) || !sameSnapshot(local.files, stored.local)) throw new Error('本地文件已变化，请重新检查。');
       if (await this.client.head() !== stored.remote.head) throw new Error('远端已变化，请重新检查。');
       const entries: ApplyEntry[] = [];
       const existing = new Set([...local.paths, ...local.directories, ...stored.remote.paths, ...stored.remote.directories]);
@@ -269,14 +409,15 @@ export class MobileEngine {
       const directories = latest.filter(entry => entry.kind === 'directory').map(entry => entry.path);
       checkPaths(paths, directories);
       checkPaths([...new Set([...paths, ...stored.remote.paths, ...entries.map(entry => entry.path)])], [...new Set([...directories, ...stored.remote.directories])]);
-      if (stored.plan.initial && paths.some(path => !path.split('/').some(part => part.startsWith('.')))) throw new Error('首次导入期间文库已变化，请重新检查。');
+      if (stored.plan.initial && !stored.plan.attach && paths.some(path => !path.split('/').some(part => part.startsWith('.')))) throw new Error('首次导入期间文库已变化，请重新检查。');
       state.journal = {
         head: stored.remote.head, baseline: stored.remote.files, entries,
         directories: stored.remote.directories.filter(allowedDirectory).sort((a,b) => a.split('/').length - b.split('/').length || a.localeCompare(b)),
         inventory: { files: stored.remote.paths, directories: stored.remote.directories },
       };
       if (entries.length || state.head !== stored.remote.head || !sameSnapshot(state.baseline, stored.remote.files)) delete state.draft;
-      await this.store.save(state);
+      if (stored.repair) await this.store.repair!(stored.repair, state);
+      else await this.store.save(state);
       const result = await this.finishJournal(state);
       this.plans.clear();
       return { preserved: result.preserved };
@@ -376,6 +517,12 @@ export class MobileEngine {
       state.baseline[path] = file;
     }
     state.head = pending.commit;
+    if (state.staged) {
+      for (const path of Object.keys(pending.files)) delete state.staged.files[path];
+      state.staged.review.changes = state.staged.review.changes.filter(change => !(change.path in pending.files));
+      state.staged.review.head = pending.commit; state.staged.review.id = crypto.randomUUID();
+      if (!state.staged.review.changes.length) delete state.staged;
+    }
     delete state.pending; delete state.draft;
     await this.store.save(state);
     return pending.commit;
@@ -402,6 +549,7 @@ export class MobileEngine {
         return this.finishUpload(state);
       }
       const draft = this.draft(state, review);
+      if (draft.review.index !== undefined) throw new Error('请先将工作区选择暂存，再提交已暂存的快照。');
       if (!selected.length || new Set(selected).size !== selected.length) throw new Error('请选择需要上传的文件。');
       if (!message.trim() || message.length > 1000 || message.includes('\0')) throw new Error('提交说明不能为空且最多 1000 个字符。');
       checkSecret(message);
@@ -410,11 +558,13 @@ export class MobileEngine {
       for (const path of selected) {
         const change = draft.review.changes.find(change => change.path === path && change.allowed);
         if (!change) throw new Error('选择包含未审阅或不允许的文件。');
-        const bytes = await this.read(path);
-        if ((bytes === null ? deleted : await blobSha(bytes)) !== change.digest) throw new Error('文件已变化，请重新检查。');
+        if (draft !== state.staged) {
+          const bytes = await this.read(path);
+          if ((bytes === null ? deleted : await blobSha(bytes)) !== change.digest) throw new Error('文件已变化，请重新检查。');
+        }
         const snapshot = draft.files[path];
         if (snapshot === undefined || (snapshot === null ? deleted : await blobSha(fromBase64(snapshot))) !== change.digest) throw new Error('上传快照校验失败。');
-        size += bytes?.length ?? 0; budget(size);
+        size += snapshot === null ? 0 : fromBase64(snapshot).length; budget(size);
         snapshots[path] = snapshot;
       }
       this.confirm(selected.filter(path => snapshots[path] === null), confirmation);

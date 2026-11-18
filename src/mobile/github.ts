@@ -5,6 +5,8 @@ export interface RemoteTree {
   head: string; tree: string; files: Record<string, BaselineFile>;
   /** All remote leaf paths, including excluded files kept by base_tree uploads. */
   paths: string[];
+  /** Metadata for history, including leaves excluded from content synchronization. */
+  leafShas?: Record<string, string>;
   /** All remote directories, including excluded namespaces, for collision checks. */
   directories: string[];
   excluded: ExcludedRemoteFile[];
@@ -59,16 +61,17 @@ export class GitHubClient {
     if (result.ref !== `refs/heads/${this.branch}` || ref.type !== 'commit') throw new Error('GitHub 分支响应无效。');
     return sha(ref.sha);
   }
-  async snapshot(): Promise<RemoteTree> {
-    const head = await this.head();
-    const commit = await this.call('GET', `commits/${head}`);
-    if (sha(commit.sha) !== head) throw new Error('GitHub 提交响应不匹配。');
-    const tree = sha(object(commit.tree).sha);
+  async snapshot(commit?: string): Promise<RemoteTree> {
+    const head = commit === undefined ? await this.head() : sha(commit);
+    const metadata = await this.call('GET', `commits/${head}`);
+    if (sha(metadata.sha) !== head) throw new Error('GitHub 提交响应不匹配。');
+    const tree = sha(object(metadata.tree).sha);
     const result = await this.call('GET', `trees/${tree}?recursive=1`);
     if (result.truncated !== false) throw new Error('远端文件列表被截断，无法安全读取完整文库。');
     if (sha(result.sha) !== tree || !Array.isArray(result.tree) || result.tree.length > 100000) throw new Error('GitHub 文件树响应无效。');
     const files: Record<string, BaselineFile> = Object.create(null) as Record<string, BaselineFile>;
     const paths: string[] = [];
+    const leafShas: Record<string,string> = Object.create(null) as Record<string,string>;
     const directories: string[] = [];
     const excluded: ExcludedRemoteFile[] = [];
     for (const raw of result.tree) {
@@ -77,6 +80,7 @@ export class GitHubClient {
       if (!validSha(entry.sha)) throw new Error(`远端路径 ${entry.path} 的 SHA 响应无效。`);
       if (entry.type === 'tree' && entry.mode === '040000') { directories.push(entry.path); continue; }
       paths.push(entry.path);
+      leafShas[entry.path] = entry.sha;
       if (entry.type !== 'blob' || !['100644', '100755', '120000', '160000'].includes(String(entry.mode))) throw new Error(`远端文件 ${entry.path} 包含不支持的节点。`);
       if (!allowedPath(entry.path)) {
         const name = entry.path.split('/').at(-1);
@@ -91,7 +95,15 @@ export class GitHubClient {
     }
     if (new Set(paths).size !== paths.length) throw new Error('远端文件树响应包含重复路径。');
     checkPaths(paths, directories);
-    return { head, tree, files, paths, directories, excluded, totalFiles: paths.length, totalDirectories: directories.length };
+    return { head, tree, files, paths, leafShas, directories, excluded, totalFiles: paths.length, totalDirectories: directories.length };
+  }
+  async commit(id: string): Promise<{ hash: string; tree: string; parents: string[]; subject: string; date: string }> {
+    const result = await this.call('GET', `commits/${sha(id)}`);
+    if (sha(result.sha) !== id || !Array.isArray(result.parents) || result.parents.length > 16 || typeof result.message !== 'string') throw new Error('GitHub 历史提交响应无效。');
+    checkSecret(result.message);
+    const date = object(result.author).date;
+    if (typeof date !== 'string' || !Number.isFinite(Date.parse(date))) throw new Error('GitHub 历史日期响应无效。');
+    return { hash: id, tree: sha(object(result.tree).sha), parents: result.parents.map(parent => sha(object(parent).sha)), subject: result.message.split('\n')[0]!.slice(0, 500), date };
   }
   async blob(file: BaselineFile): Promise<Uint8Array> {
     const id = sha(file.sha);

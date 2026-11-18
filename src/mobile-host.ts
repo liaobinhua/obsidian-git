@@ -100,7 +100,8 @@ export class MobileFiles implements LocalFiles {
 }
 
 interface Envelope { version: 1; sequence: number; checksum: string; payload: string }
-class StateCorruption extends Error { constructor() { super('本地同步记录损坏或写入校验失败，请保留文档并检查状态备份。'); } }
+export class StateCorruption extends Error { constructor() { super('本地同步记录损坏或写入校验失败，请保留文档并检查状态备份。'); } }
+export class StateVersionError extends Error { constructor() { super('本地记录格式来自不兼容的版本，请保留记录并使用兼容版本读取。'); } }
 function parse(value: string): unknown { try { return JSON.parse(value); } catch { throw new StateCorruption(); } }
 const MAX_STATE_BYTES = 80 * 1024 * 1024;
 async function checksum(payload: string): Promise<string> {
@@ -123,9 +124,12 @@ export class RotatingStateStore implements StateStore {
     const raw = parse(await this.adapter.read(path));
     if (!raw || typeof raw !== 'object') throw new StateCorruption();
     const value = raw as Partial<Envelope>;
-    if (value.version !== 1 || !Number.isSafeInteger(value.sequence) || value.sequence! < 1 || typeof value.payload !== 'string' || typeof value.checksum !== 'string' || await checksum(value.payload) !== value.checksum) throw new StateCorruption();
+    if (!('version' in value)) throw new StateCorruption();
+    if (value.version !== 1) throw new StateVersionError();
+    if (!Number.isSafeInteger(value.sequence) || value.sequence! < 1 || typeof value.payload !== 'string' || typeof value.checksum !== 'string' || await checksum(value.payload) !== value.checksum) throw new StateCorruption();
     const state = parse(value.payload);
-    if (!state || typeof state !== 'object' || !('version' in state) || state.version !== 1) throw new StateCorruption();
+    if (!state || typeof state !== 'object' || !('version' in state)) throw new StateCorruption();
+    if (state.version !== 1) throw new StateVersionError();
     return value as Envelope;
   }
 
@@ -139,8 +143,8 @@ export class RotatingStateStore implements StateStore {
       catch (error) { if (!(error instanceof StateCorruption)) throw error; }
     }
     candidates.sort((a,b) => b.sequence - a.sequence);
-    if (found && !candidates.length) throw new Error('本地同步记录损坏，请保留文档并检查状态备份。');
-    if (candidates.length === 2 && candidates[0]!.sequence === candidates[1]!.sequence && candidates[0]!.checksum !== candidates[1]!.checksum) throw new Error('同步记录的两个版本不一致，请保留备份。');
+    if (found && !candidates.length) throw new StateCorruption();
+    if (candidates.length === 2 && candidates[0]!.sequence === candidates[1]!.sequence && candidates[0]!.checksum !== candidates[1]!.checksum) throw new StateCorruption();
     return candidates[0] ?? null;
   }
 

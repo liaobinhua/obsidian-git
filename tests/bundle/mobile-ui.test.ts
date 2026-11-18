@@ -28,9 +28,10 @@ test('Android applies and reports the same conflict choices when controls change
     async loadData() { return {}; }
     addStatusBarItem() { return { setText() {} }; }
     addSettingTab() {} addRibbonIcon() {} addCommand() {}
+    registerView() {}
   }
   class Notice { constructor(message: string) { notices.push(message); } hide() {} }
-  const sdk = { Plugin, Modal, Notice, PluginSettingTab: class {}, Platform: { isAndroidApp: true }, TextFileView: class {}, TFile: class {} };
+  const sdk = { Plugin, ItemView:class {}, Modal, Notice, PluginSettingTab: class {}, Platform: { isAndroidApp: true }, TextFileView: class {}, TFile: class {} };
   interface Probe {
     onload(): Promise<void>; onunload(): void; showPull(): Promise<void>;
     settings: { secretName: string }; repository(): unknown;
@@ -44,14 +45,16 @@ test('Android applies and reports the same conflict choices when controls change
   assert.ok(module.exports.default);
   const plugin = new module.exports.default(); await plugin.onload(); plugin.settings.secretName = 'fixture';
   let release!: (result: { preserved: string[] }) => void; let applied!: Record<string, string>;
+  let began!:()=>void;const applying=new Promise<void>(resolve=>{began=resolve;});
   const engine = {
+    inspectVault:async()=>({initialized:true}),
     planPull: async () => ({
       id: 'review', head: 'a'.repeat(40), initial: false, directories: [], deletions: [],
       summary: { remoteFiles: 1, remoteDirectories: 0, managedFiles: 1, excluded: [] },
       changes: [{ path: 'note.md', kind: 'conflict', deleted: false }],
     }),
     applyPull: async (_plan: unknown, choices: Record<string, string>) => {
-      applied = choices; return new Promise<{ preserved: string[] }>(resolve => { release = resolve; });
+      applied = choices; return new Promise<{ preserved: string[] }>(resolve => { release = resolve;began(); });
     },
   };
   plugin.repository = () => engine; await plugin.showPull();
@@ -60,6 +63,7 @@ test('Android applies and reports the same conflict choices when controls change
   const button = nodes.find(node => node.tag === 'button' && node.text === '应用已检查的更新'); assert.ok(button);
   button.events.click!();
   select.value = 'local'; select.events.change!();
+  await applying;
   assert.equal(applied['note.md'], 'remote', 'later UI input must not mutate the approved application snapshot');
   release({ preserved: [] }); await new Promise(resolve => setTimeout(resolve, 0));
   assert.match(notices.at(-1)!, /下载或更新 1 个文件/);

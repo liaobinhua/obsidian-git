@@ -83,7 +83,10 @@ async function fixture(initial: Record<string, string | Uint8Array> = { 'first.m
     if(controls.status) return answer(controls.status,{message:'private server message token SHOULD_NOT_LEAK'});
     if(controls.invalid) return answer(200,{bad:true});
     if(path==='ref/heads/main' || path==='refs/heads/main' && req.method==='GET') return answer(200,{ref:'refs/heads/main',object:{type:'commit',sha:current()}});
-    if(path.startsWith('commits/') && req.method==='GET') return answer(200,{sha:path.slice(8),tree:{sha:run(['rev-parse',`${path.slice(8)}^{tree}`])}});
+    if(path.startsWith('commits/') && req.method==='GET') {
+      const id=path.slice(8);const parents=run(['show','-s','--format=%P',id]).split(' ').filter(Boolean);
+      return answer(200,{sha:id,tree:{sha:run(['rev-parse',`${id}^{tree}`])},parents:parents.map(sha=>({sha})),message:run(['show','-s','--format=%B',id]),author:{date:run(['show','-s','--format=%aI',id])}});
+    }
     if(path.startsWith('trees/') && req.method==='GET') {
       const entries=run(['ls-tree','-rz','-r','-t',path.slice(6)]).split('\0').filter(Boolean).map(line=>{
         const match=/^(\d+) (\w+) ([a-f0-9]+)\t([\s\S]+)$/.exec(line)!;
@@ -126,13 +129,103 @@ async function fixture(initial: Record<string, string | Uint8Array> = { 'first.m
   };
   const files=new Files(); const store=new Store();
   const client=new GitHubClient({repository:'example/notes',branch:'main',token:async()=>'fixture-only',request});
-  const make=()=>new MobileEngine({repository:'example/notes',branch:'main',files,store,client});
+  const make=(override:StateStore=store)=>new MobileEngine({repository:'example/notes',branch:'main',files,store:override,client});
   const engine=make();
   const imported=async()=>{await engine.applyPull(await engine.planPull());};
   return {root,run,files,store,engine,client,make,controls,advance,current,imported};
 }
 
 describe('portable mobile synchronization against a local HTTP and bare Git fixture',()=> {
+  it('inspects existing notes without network or state writes before attaching the current folder',async()=>{
+    const f=await fixture();f.files.set('local.md','my unfinished note');
+    const status=await f.engine.inspectVault();assert.equal(status.initialized,false);assert.equal(status.changes[0]?.path,'local.md');
+    assert.equal(f.store.saves,0);assert.equal(f.controls.requests.length,0);
+    const plan=await f.engine.planAttach();assert.equal(plan.attach,true);assert.equal(plan.deletions.length,0);
+    await f.engine.applyAttach(plan);assert.equal(f.files.text('local.md'),'my unfinished note');assert.equal(f.files.text('first.md'),'one\ntwo\nthree\n');
+    assert.equal((await f.engine.inspectVault()).changes.find(c=>c.path==='local.md')?.status,'add');
+    assert.equal(f.controls.requests.filter(request=>request.method!=='GET').length,0);
+  });
+  it('attaches same documents and resolves divergent names explicitly without inferring deletion',async()=>{
+    const f=await fixture({'equal.md':'same','conflict.md':'remote','remote.md':'remote only'});
+    f.files.set('equal.md','same');f.files.set('conflict.md','local');f.files.set('local.md','local only');
+    const plan=await f.engine.planAttach();assert.equal(plan.deletions.length,0);
+    assert.equal(plan.changes.find(c=>c.path==='conflict.md')?.kind,'conflict');
+    await assert.rejects(f.engine.applyAttach(plan),/冲突/);
+    await f.engine.applyAttach(plan,{'conflict.md':'both'});
+    assert.equal(f.files.text('conflict.md'),'remote');assert.equal(f.files.text('conflict.local-copy.md'),'local');
+    assert.equal(f.files.text('local.md'),'local only');assert.equal(f.files.text('remote.md'),'remote only');
+    const changed=(await f.engine.inspectVault()).changes;assert(!changed.some(c=>c.path==='equal.md'));assert(changed.every(c=>c.status!=='delete'));
+  });
+  it('keeps attach plans read-only and rejects notes edited after the connection preview',async()=>{
+    const f=await fixture();f.files.set('local.md','original');const plan=await f.engine.planAttach();
+    assert.equal(f.store.saves,0);f.files.set('local.md','later');await assert.rejects(f.engine.applyAttach(plan),/变化/);
+    assert.equal(f.files.text('local.md'),'later');assert.equal(f.files.text('first.md'),null);assert.equal(f.store.saves,0);
+  });
+  it('repairs only an explicitly previewed corrupt record before document application',async()=>{
+    const f=await fixture();f.files.set('local.md','keep');let corrupt=true;let prepared=0;let repaired=0;
+    const store:StateStore={load:async()=>{if(corrupt)throw new Error('corrupt');return f.store.load();},save:state=>f.store.save(state),
+      prepareRepair:async()=>{prepared++;return 'fingerprint';},repair:async(token,state)=>{assert.equal(token,'fingerprint');repaired++;corrupt=false;await f.store.save(state);}};
+    const engine=f.make(store);await assert.rejects(engine.planAttach(),/corrupt/);assert.equal(prepared,0);
+    const plan=await engine.planAttach({repair:true});assert.equal(repaired,0);assert.equal(f.store.saves,0);assert.equal(f.files.text('first.md'),null);
+    await engine.applyAttach(plan);assert.equal(repaired,1);assert.equal(f.files.text('local.md'),'keep');assert.equal(f.files.text('first.md'),'one\ntwo\nthree\n');
+    assert.equal(f.controls.requests.filter(request=>request.method!=='GET').length,0);
+  });
+  it('keeps reviewed staging across restart and later edits, then uploads only staged bytes',async()=>{
+    const f=await fixture();await f.imported();f.files.set('first.md','staged text');f.files.set('other.md','not staged');
+    const review=await f.engine.review();const staged=await f.engine.stage(review,['first.md']);
+    f.files.set('first.md','newer worktree edit');const savedDraft=structuredClone(f.store.state!.draft);
+    const restarted=f.make();const status=await restarted.inspectVault();assert.equal(status.staged?.id,staged.id);assert.deepEqual(f.store.state!.draft,savedDraft);
+    assert.match(await restarted.preview(staged,'first.md'),/staged text/);
+    await restarted.upload(staged,['first.md'],'upload staged');
+    assert.equal(f.run(['show',`${f.current()}:first.md`]),'staged text');assert.equal(f.files.text('first.md'),'newer worktree edit');assert.equal(f.files.text('other.md'),'not staged');
+    assert.equal((await restarted.inspectVault()).staged,null);
+    assert.equal((await restarted.review()).changes.find(c=>c.path==='first.md')?.status,'modify');
+  });
+  it('unstages selections without deleting notes and preserves stale staging after a remote pull',async()=>{
+    const f=await fixture();await f.imported();f.files.set('first.md','staged');f.files.set('local.md','keep');
+    let staged=await f.engine.stage(await f.engine.review(),['first.md','local.md']);await f.engine.unstage(['local.md']);
+    staged=(await f.engine.inspectVault()).staged!;assert.deepEqual(staged.changes.map(c=>c.path),['first.md']);assert.equal(f.files.text('local.md'),'keep');
+    f.advance({'remote.md':'remote new'});await f.engine.applyPull(await f.engine.planPull());
+    assert.equal((await f.make().inspectVault()).staged?.id,staged.id);
+    await assert.rejects(f.make().upload(staged,['first.md'],'stale'),/审阅|基线|暂存/);
+    await f.make().unstage(['first.md']);assert.equal((await f.make().inspectVault()).staged,null);
+  });
+  it('separates index and worktree status when staged bytes match the worktree',async()=>{
+    const f=await fixture({'note.md':'A'});await f.imported();f.files.set('note.md','B');
+    await f.engine.stage(await f.engine.reviewWorking(),['note.md']);
+    const state=await f.make().inspectVault();assert.equal(state.changes[0]?.path,'note.md');
+    assert.equal(state.staged?.changes[0]?.path,'note.md');assert.deepEqual(state.workingChanges,[]);
+    assert.deepEqual((await f.make().reviewWorking()).changes,[]);
+  });
+  it('shows edits back to baseline relative to the staged index and restaging cancels the staged change',async()=>{
+    const f=await fixture({'note.md':'A'});await f.imported();f.files.set('note.md','B');
+    await f.engine.stage(await f.engine.reviewWorking(),['note.md']);f.files.set('note.md','A');
+    let state=await f.make().inspectVault();assert.deepEqual(state.changes,[]);assert.equal(state.workingChanges[0]?.path,'note.md');
+    const review=await f.make().reviewWorking();assert.equal(review.changes[0]?.status,'modify');
+    assert.match(await f.make().preview(review,'note.md'),/基线：暂存区\nB\n\n当前快照\nA/);
+    const result=await f.make().stage(review,['note.md']);assert.deepEqual(result.changes,[]);
+    state=await f.make().inspectVault();assert.equal(state.staged,null);assert.deepEqual(state.changes,[]);assert.deepEqual(state.workingChanges,[]);
+    assert.equal(f.files.text('note.md'),'A');assert.equal(f.controls.requests.filter(r=>r.method!=='GET').length,0);
+  });
+  it('restaging cancels a staged addition removed locally and a staged deletion restored locally',async()=>{
+    for(const initial of [{}, {'note.md':'A'}] as Record<string,string>[]) {
+      const f=await fixture(initial);
+      await f.imported();
+      if('note.md' in initial)await f.files.remove('note.md');else f.files.set('note.md','B');
+      await f.engine.stage(await f.engine.reviewWorking(),['note.md']);
+      if('note.md' in initial)f.files.set('note.md','A');else await f.files.remove('note.md');
+      const review=await f.make().reviewWorking();assert.equal(review.changes[0]?.status,'note.md' in initial?'add':'delete');
+      await f.make().stage(review,['note.md']);const status=await f.make().inspectVault();
+      assert.equal(status.staged,null);assert.deepEqual(status.workingChanges,[]);assert.deepEqual(status.changes,[]);
+    }
+  });
+  it('reads real commit history and text differences using GET requests only',async()=>{
+    const f=await fixture({'note.md':'before'});const initial=f.current();const next=f.advance({'note.md':'after','new.md':'added'});
+    const history=await f.engine.history();assert.deepEqual(history.map(c=>c.hash),[next,initial]);assert.equal(history[0]?.subject,'Remote');
+    assert.deepEqual(await f.engine.historyFiles(next),[{path:'new.md',status:'add'},{path:'note.md',status:'modify'}]);
+    const preview=await f.engine.historyPreview(next,'note.md');assert.match(preview,/before/);assert.match(preview,/after/);
+    assert.equal(f.controls.requests.filter(request=>request.method!=='GET').length,0);assert.equal(f.store.saves,0);
+  });
   const complete = () => ({
     'inbox/a.md':'a','notes/b.md':'b','notes/c.md':'c','archive/d.md':'d','archive/e.md':'e',
     ...Object.fromEntries(Array.from({length:7},(_,i)=>[`empty-${i}/.gitkeep`,''])),'.gitignore':'ignored',
