@@ -4,19 +4,11 @@ import { constants } from 'node:fs';
 import { copyFile, lstat, mkdtemp, open, realpath, rename, rm } from 'node:fs/promises';
 import { homedir } from 'node:os';
 import { extname, join, resolve } from 'node:path';
+import { allowedPath } from './mobile/policy.ts';
+export { allowedPath } from './mobile/policy.ts';
 
 const MAX_BYTES = 20 * 1024 * 1024;
-const EXTENSIONS = new Set(['.md', '.txt', '.csv', '.pdf', '.png', '.jpg', '.jpeg', '.gif', '.webp']);
 const SECRET = /-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----|github_pat_[A-Za-z0-9_]{20,}|gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}/;
-
-export function allowedPath(path: string): boolean {
-  const parts = path.split('/');
-  return path.length > 0 && !path.includes('\\') && !/[\x00-\x1f\x7f]/.test(path)
-    && parts.every(part => part.length > 0 && part !== '..' && !part.startsWith('.')
-      && !/(?:^|[-_.])(?:secrets?|credentials?|tokens?|passwords?|private[-_]?keys?)(?:[-_.]|$)/i.test(part)
-      && !['keys', 'ssh'].includes(part.toLowerCase()))
-    && EXTENSIONS.has(extname(path).toLowerCase());
-}
 
 export function safeEnvironment(source: NodeJS.ProcessEnv = process.env): NodeJS.ProcessEnv {
   return {

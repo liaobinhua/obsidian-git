@@ -6,3 +6,12 @@
 .wudao-git-preview { max-height: 280px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere; font-size: var(--font-smaller); }
 .wudao-git-message { width: 100%; margin-block: 12px; }
 .wudao-git-actions { display: flex; justify-content: flex-end; gap: 8px; }
+.wudao-git-check { display: flex; align-items: baseline; gap: 8px; margin-block: 10px; overflow-wrap: anywhere; }
+.wudao-git-list section, .wudao-git-row > span { overflow-wrap: anywhere; }
+.wudao-git-row select { max-width: 100%; }
+@media (max-width: 600px) {
+  .wudao-git-list { max-height: 32vh; }
+  .wudao-git-preview { max-height: 25vh; }
+  .wudao-git-actions { flex-wrap: wrap; }
+  .wudao-git-actions button { flex: 1 1 130px; }
+}

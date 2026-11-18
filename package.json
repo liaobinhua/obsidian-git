@@ -1,6 +1,6 @@
 {
   "name": "obsidian-git-reviewed",
-  "version": "0.1.0",
+  "version": "0.2.0",
   "private": true,
   "description": "A small Obsidian Git plugin with explicit review before commit and push.",
   "type": "module",
@@ -8,8 +8,9 @@
     "build": "node build.mjs",
     "typecheck": "tsc --noEmit",
     "test": "node --experimental-strip-types --test tests/*.test.ts",
-    "test:coverage": "node --experimental-strip-types --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-exclude='src/main.ts' --test-coverage-lines=80 --test tests/*.test.ts",
-    "check": "bun run typecheck && bun run test:coverage && bun run build"
+    "test:bundle": "node --experimental-strip-types --test tests/bundle/*.test.ts",
+    "test:coverage": "node --experimental-strip-types --experimental-test-coverage --test-coverage-include='src/**' --test-coverage-exclude='src/main.ts' --test-coverage-exclude='src/mobile-main.ts' --test-coverage-exclude='src/mobile-ui.ts' --test-coverage-lines=80 --test tests/*.test.ts",
+    "check": "bun run typecheck && bun run test:coverage && bun run build && bun run test:bundle"
   },
   "devDependencies": {
     "@types/node": "26.6.6",
