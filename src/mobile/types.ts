@@ -7,6 +7,8 @@ export interface LocalFiles {
   read(path: string): Promise<Uint8Array | null>;
   write(path: string, bytes: Uint8Array): Promise<void>;
   remove(path: string): Promise<void>;
+  /** Create a directory idempotently; reject file/link ancestors or destinations. */
+  mkdir(path: string): Promise<void>;
 }
 
 export interface RequestOptions {
@@ -29,7 +31,14 @@ export interface PullChange {
   kind: 'remote' | 'local' | 'conflict' | 'same';
   deleted: boolean;
 }
-export interface PullPlan { id: string; head: string; initial: boolean; changes: PullChange[]; deletions: string[] }
+export interface ExcludedRemoteFile { path: string; reason: string }
+export interface PullPlan {
+  id: string; head: string; initial: boolean; changes: PullChange[]; deletions: string[];
+  /** Missing safe directories to create; existing local directories are never deleted. */
+  directories: string[];
+  summary: { remoteFiles: number; managedFiles: number; remoteDirectories: number; excluded: ExcludedRemoteFile[] };
+}
+export interface ApplyPullResult { preserved: string[] }
 export type Resolution = 'local' | 'remote' | 'both';
 export interface Confirmation { deletions: string[]; bulkDelete: boolean }
 export interface ApplyEntry { path: string; before: string | null; after: string | null }
@@ -44,7 +53,13 @@ export interface MobileState {
   baseline: Record<string, BaselineFile>;
   draft?: { review: MobileReview; files: Record<string, string | null> };
   pending?: PendingUpload;
-  journal?: { head: string; baseline: Record<string, BaselineFile>; entries: ApplyEntry[] };
+  journal?: {
+    head: string; baseline: Record<string, BaselineFile>; entries: ApplyEntry[];
+    /** All safe remote directories to ensure at apply and recovery, not only the preview delta. */
+    directories?: string[];
+    /** Full remote namespace, including excluded files, for recovery collision checks. */
+    inventory?: { files: string[]; directories: string[] };
+  };
 }
 export interface StateStore {
   load(): Promise<MobileState | null>;

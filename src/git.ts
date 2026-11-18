@@ -40,6 +40,7 @@ export interface Review {
 
 export interface OutgoingCommit { hash: string; subject: string; files: string[] }
 export interface PushReview { head: string; branch: string; remoteHead: string; commits: OutgoingCommit[] }
+export interface PushResult { commit: string; trackingUpdated: boolean }
 
 class GitError extends Error {
   code: number;
@@ -252,10 +253,25 @@ export class Repository {
 
   protected async transfer(args: string[]): Promise<Buffer> { return this.run(args); }
 
+  private async refreshTracking(ref: string, head: string): Promise<boolean> {
+    try {
+      const previous = await this.optional(['rev-parse', '--verify', '--quiet', ref]);
+      if (previous === head) return true;
+      if (previous && !await this.ancestor(previous, head)) return false;
+      await this.run(['update-ref', ref, head, previous || '0'.repeat(head.length)]);
+      return true;
+    } catch (error) {
+      if (error instanceof GitError) return false;
+      throw error;
+    }
+  }
+
   private async fetch(branch: string): Promise<string> {
     const tracking = this.tracking(branch);
     await this.transfer(['fetch', '--no-tags', '--no-recurse-submodules', this.url, `+refs/heads/${branch}:${tracking}`]);
-    return this.text(['rev-parse', '--verify', tracking]);
+    const head = await this.text(['rev-parse', '--verify', tracking]);
+    await this.refreshTracking(`refs/remotes/origin/${branch}`, head);
+    return head;
   }
 
   private async ancestor(older: string, newer: string): Promise<boolean> {
@@ -294,7 +310,7 @@ export class Repository {
     });
   }
 
-  async push(review: PushReview): Promise<void> {
+  async push(review: PushReview): Promise<PushResult> {
     return this.exclusive(async () => {
       const state = await this.guard();
       if (state.head !== review.head || state.branch !== review.branch) throw new Error('本地提交已变化，请重新检查待推送提交。');
@@ -302,6 +318,9 @@ export class Repository {
       const commits = await this.inspectCommits(review.remoteHead, review.head);
       if (JSON.stringify(commits) !== JSON.stringify(review.commits)) throw new Error('待推送提交已变化，请重新检查。');
       if (commits.length) await this.transfer(['push', '--porcelain', this.url, `${review.head}:refs/heads/${review.branch}`]);
+      const origin = await this.refreshTracking(`refs/remotes/origin/${review.branch}`, review.head);
+      const own = await this.refreshTracking(this.tracking(review.branch), review.head);
+      return { commit: review.head, trackingUpdated: origin && own };
     });
   }
 

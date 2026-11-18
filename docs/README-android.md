@@ -2,7 +2,7 @@
 
 ## 0.1 Objective/Coverage
 
-本文说明 Wudao Git Android 包的安装、手机令牌、首次下载、日常上传、冲突处理、恢复和真机验收。0.2.0 为候选版本；自动化验证不代表完成真机验收。
+本文说明 Wudao Git Android 包的安装、手机令牌、首次下载、日常上传、冲突处理、恢复和真机验收。0.2.1 为候选版本；自动化验证不代表完成真机验收。
 
 ## 1. 准备电脑数据
 
@@ -11,7 +11,7 @@
 ## 2. 安装 Android 包
 
 1. 在 Android Obsidian 新建空白文库，例如 `Documents/wudao-test`。如果生成欢迎文章，先将其移到其他地方保留。
-2. 从本项目 Releases 下载 `wudao-git-0.2.0-android.zip`。
+2. 从本项目 Releases 下载 `wudao-git-0.2.1-android.zip`。
 3. 在手机文件管理器启用显示隐藏文件，创建 `<文库>/.obsidian/plugins/wudao-git/`。
 4. 解压并把 `main.js`、`manifest.json` 和 `styles.css` 放进该目录，避免多嵌套一层 ZIP 名称目录。
 5. 重新打开 Obsidian，在第三方插件中启用 Wudao Git。不要同时启用其他同步同一文库的插件。
@@ -20,9 +20,9 @@
 
 ## 3. 配置并首次下载
 
-在 GitHub 创建手机专用细粒度令牌，选择 `Only selected repositories` 中的文章仓库，授予 `Contents: Read and write`，设置到期时间。不要提供仓库管理权限或将令牌粘贴到聊天。
+在 GitHub 创建手机专用细粒度令牌，选择 `Only selected repositories` 中的文章仓库，授予 `Contents: Read and write`。有效期由你选择，也可以保留现有的不过期令牌。不要提供仓库管理权限或将令牌粘贴到聊天。
 
-在插件设置中填写 `owner/repository` 和分支，在 SecretStorage 中添加令牌并选择其引用名称，点击保存。保持默认的仅下载模式，运行“首次下载或检查远端更新”，核对文件计划后应用。检查文章、模板和附件后再启用“允许上传”。模板目录可设为 `90-模板`，附件目录可设为 `99-附件`。
+在插件设置中填写 `owner/repository` 和分支，在 SecretStorage 中添加令牌并选择其引用名称，点击“保存设置”或“保存并检查远端更新”。保持默认的仅下载模式，核对文件与目录计划后点击“应用已检查的更新”。检查文章、模板和附件后再启用“允许上传”。模板目录可设为 `90-模板`，附件目录可设为 `99-附件`。
 
 ## 4. 日常使用
 
@@ -52,3 +52,15 @@
 
 - [GitHub 细粒度令牌](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
 - [Obsidian SecretStorage](https://docs.obsidian.md/plugins/guides/secret-storage)
+
+## 8. 从旧版本升级与完整性检查
+
+先备份手机文库，再停用 Wudao Git；仅用 Android 安装包覆盖插件目录中的 main.js、manifest.json 和 styles.css，保留 data.json、mobile-state-a.json、mobile-state-b.json 及恢复文件。重新打开并启用插件，设置页应显示 0.2.1。无需清空文库、删除同步状态或重新生成令牌。
+
+点击“保存并检查远端更新”：预览会显示 GitHub 文件与目录总数、参与同步的文档数、待补齐目录和主动排除文件的理由。此时只是检查，还没有应用到手机；确认后点击“应用已检查的更新”。即使远端提交号没有变化，也能给已有 0.2.0 文库补齐缺少的分类目录。
+
+.gitkeep 等占位文件本身仍不下载，但对应安全目录会建立。本地已有目录不会自动删除；在手机新建目录后写入文章，再将文章上传，GitHub 就能保存该目录路径。当前仍采用文档与常用附件白名单，排除项会明确展示，不能将主动排除解释为下载失败。
+
+手机文章有更新：开启“允许上传”并保存设置，再运行“检查并上传选中文件”，选择新增、修改或删除项，填写说明，最后确认上传。电脑文章有更新：运行“检查并提交选中文件”，提交后再确认推送。“本地保存”“Git 提交”和“远端上传”是不同步骤。
+
+插件代码有新版本：从公开插件项目 Releases 下载对应平台安装包，按上面的保留数据升级步骤操作。此更新不会自动上传你的文章，也不会更改令牌有效期。

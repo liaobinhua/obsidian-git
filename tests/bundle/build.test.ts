@@ -14,10 +14,12 @@ test('Android artifact has no native Node imports and starts without process, Bu
     onload(): Promise<void>; onunload(): void; run(action: () => Promise<void>): Promise<void>;
     showChanges(): Promise<void>; showPull(): Promise<void>; recover(): Promise<void>;
     repository(): unknown; store(): { load(): Promise<unknown> };
-    settings: { uploadEnabled: boolean; secretName: string };
+    configure(settings: { repository: string; branch: string; secretName: string; uploadEnabled: boolean }): Promise<boolean>;
+    settings: { repository: string; branch: string; uploadEnabled: boolean; secretName: string };
   }
   const module = { exports: {} as { default?: new () => Probe } };
   let saved = 0;
+  let failSave = false; let persisted: unknown;
   const views: { view: object }[] = [];
   class TextFileView { async save() { saved++; } }
   class Plugin {
@@ -28,6 +30,7 @@ test('Android artifact has no native Node imports and starts without process, Bu
     };
     manifest = { ...manifest, dir: '.obsidian/plugins/wudao-git' };
     async loadData() { return {}; }
+    async saveData(data: unknown) { if (failSave) throw new Error('disk unavailable'); persisted = structuredClone(data); }
     addStatusBarItem() { return { setText() {} }; }
     addSettingTab() {}
     addRibbonIcon() {}
@@ -64,6 +67,17 @@ test('Android artifact has no native Node imports and starts without process, Bu
   assert.equal(invoked, false, 'stopping during an awaited save must stop the operation');
   views.splice(0);
   const review = { id: 'fixture', head: '', changes: [] };
+  const configured = new module.exports.default(); await configured.onload();
+  const next = { repository: 'example/notes', branch: 'main', secretName: 'wudao-android', uploadEnabled: true };
+  failSave = true;
+  assert.equal(await configured.configure(next), false);
+  assert.equal(configured.settings.repository, '', 'failed persistence must not switch the target');
+  assert.equal(configured.settings.uploadEnabled, false);
+  failSave = false;
+  assert.equal(await configured.configure(next), true);
+  assert.equal(configured.settings.repository, 'example/notes');
+  assert.equal(JSON.stringify(persisted).includes('fixture-only'), false);
+  configured.onunload();
   const plan = { id: 'fixture', head: '', initial: false, changes: [], deletions: [] };
   const recovery = { pending: true, preserved: [] };
   for (const method of ['showChanges', 'showPull', 'recover'] as const) {

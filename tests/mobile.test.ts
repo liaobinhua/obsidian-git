@@ -5,7 +5,7 @@ import { execFileSync } from 'node:child_process';
 import { mkdtemp, rm } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
-import { MobileEngine, GitHubClient, GitHubError, allowedPath } from '../src/mobile/index.ts';
+import { MobileEngine, GitHubClient, GitHubError, allowedDirectory, allowedPath } from '../src/mobile/index.ts';
 import type { LocalFiles, MobileState, RequestOptions, StateStore } from '../src/mobile/types.ts';
 import { fromBase64 } from '../src/mobile/policy.ts';
 
@@ -20,6 +20,7 @@ class Files implements LocalFiles {
   links: string[] = [];
   fail = '';
   partial = '';
+  failDirectory = '';
   async list(): ReturnType<LocalFiles['list']> {
     const directories=new Set(this.directories);
     for(const path of this.data.keys())for(let slash=path.indexOf('/');slash>=0;slash=path.indexOf('/',slash+1))directories.add(path.slice(0,slash));
@@ -33,6 +34,12 @@ class Files implements LocalFiles {
     this.data.set(path, bytes.slice());
   }
   async remove(path: string) { this.data.delete(path); }
+  async mkdir(path: string) {
+    if (this.data.has(path)) throw new Error('path is a file');
+    if (path === this.failDirectory) throw new Error('directory creation interrupted');
+    if ([...this.data.keys()].some(file => file.startsWith(`${path}/`))) return;
+    this.directories.add(path);
+  }
   set(path: string, text: string) { this.data.set(path, encode(text)); }
   text(path: string) { return decode(this.data.get(path) ?? null); }
 }
@@ -78,7 +85,7 @@ async function fixture(initial: Record<string, string | Uint8Array> = { 'first.m
     if(path==='ref/heads/main' || path==='refs/heads/main' && req.method==='GET') return answer(200,{ref:'refs/heads/main',object:{type:'commit',sha:current()}});
     if(path.startsWith('commits/') && req.method==='GET') return answer(200,{sha:path.slice(8),tree:{sha:run(['rev-parse',`${path.slice(8)}^{tree}`])}});
     if(path.startsWith('trees/') && req.method==='GET') {
-      const entries=run(['ls-tree','-rz','-r',path.slice(6)]).split('\0').filter(Boolean).map(line=>{
+      const entries=run(['ls-tree','-rz','-r','-t',path.slice(6)]).split('\0').filter(Boolean).map(line=>{
         const match=/^(\d+) (\w+) ([a-f0-9]+)\t([\s\S]+)$/.exec(line)!;
         return {mode:match[1],type:match[2],sha:match[3],path:match[4],size: Number(run(['cat-file','-s',match[3]!]))};
       });
@@ -126,6 +133,129 @@ async function fixture(initial: Record<string, string | Uint8Array> = { 'first.m
 }
 
 describe('portable mobile synchronization against a local HTTP and bare Git fixture',()=> {
+  const complete = () => ({
+    'inbox/a.md':'a','notes/b.md':'b','notes/c.md':'c','archive/d.md':'d','archive/e.md':'e',
+    ...Object.fromEntries(Array.from({length:7},(_,i)=>[`empty-${i}/.gitkeep`,''])),'.gitignore':'ignored',
+  });
+  it('imports all ten safe directories and reports every excluded leaf without reading placeholder bodies',async()=>{
+    const f=await fixture(complete());const remote=await f.client.snapshot();
+    assert.equal(remote.totalFiles,13);assert.equal(remote.totalDirectories,10);assert.equal(remote.directories.length,10);
+    const plan=await f.engine.planPull();assert.equal(plan.directories.length,10);
+    assert.equal(plan.summary.remoteFiles,13);assert.equal(plan.summary.managedFiles,5);assert.equal(plan.summary.remoteDirectories,10);
+    assert.equal(plan.summary.excluded.length,8);assert(plan.summary.excluded.every(entry=>entry.reason.length>0));
+    assert(plan.summary.excluded.some(entry=>entry.path==='.gitignore'));assert(plan.summary.excluded.some(entry=>entry.path==='empty-0/.gitkeep'));
+    await f.engine.applyPull(plan);assert.equal(f.files.directories.size,10);assert.equal(f.files.data.size,5);
+    assert.equal(f.controls.requests.filter(request=>new URL(request.url).pathname.includes('/blobs/')).length,5);
+    f.files.set('inbox/a.md','reviewed');await f.engine.upload(await f.engine.review(),['inbox/a.md'],'selected');
+    assert.equal(f.run(['show',`${f.current()}:empty-0/.gitkeep`]),'');assert.equal(f.run(['show',`${f.current()}:.gitignore`]),'ignored');
+  });
+  it('keeps directory security restrictions and retains local folders removed from the remote tree',async()=>{
+    for(const path of ['.obsidian','config','configs','keys','ssh','safe/private-keys','safe/tokens','../outside'])assert.equal(allowedDirectory(path),false,path);
+    const f=await fixture({'safe/nested/.gitkeep':'','.obsidian/config.json':'private','config/settings.md':'private','keys/a.txt':'private'});
+    const plan=await f.engine.planPull();assert.deepEqual(plan.directories,['safe','safe/nested']);assert.equal(plan.summary.excluded.length,4);
+    await f.engine.applyPull(plan);assert.equal(f.files.data.size,0);assert.equal(f.controls.requests.some(request=>new URL(request.url).pathname.includes('/blobs/')),false);
+    f.advance({'safe/nested/.gitkeep':null});const next=await f.engine.planPull();await f.engine.applyPull(next);
+    assert.deepEqual([...f.files.directories],['safe','safe/nested']);assert.equal(next.directories.length,0);
+  });
+  it('rejects remote empty directory case, Unicode and file-directory collisions before any local write',async()=>{
+    for(const [left,right] of [['Empty','empty'],['caf\u00e9','cafe\u0301'],['first.md','first.md']]) {
+      const f=await fixture();f.controls.transform=(path,json)=>{
+        if(path.startsWith('trees/')) {const value=json as {tree:Record<string,unknown>[]};value.tree.push(...[left,right].map(name=>({path:name,type:'tree',mode:'040000',sha:'0'.repeat(40)})));}
+        return json;
+      };
+      await assert.rejects(f.engine.planPull(),/冲突|collision/);assert.equal(f.store.saves,0);assert.equal(f.files.directories.size,0);
+    }
+  });
+  it('fills seven missing placeholder directories on the same old baseline while preserving files and a saved draft',async()=>{
+    const f=await fixture(complete());await f.imported();f.files.directories.clear();
+    f.files.set('inbox/a.md','unsynced');await f.engine.review();const before=structuredClone(f.store.state!);const requests=f.controls.requests.length;
+    const plan=await f.make().planPull();assert.equal(plan.directories.length,7);assert.equal(plan.initial,false);
+    const engine=f.make();const next=await engine.planPull();await engine.applyPull(next);
+    assert.equal(f.files.text('inbox/a.md'),'unsynced');assert.equal(f.files.directories.size,7);
+    assert.equal(f.store.state!.head,before.head);assert.deepEqual(f.store.state!.baseline,before.baseline);assert.deepEqual(f.store.state!.draft,before.draft);
+    assert.equal(f.controls.requests.slice(requests).filter(request=>new URL(request.url).pathname.includes('/blobs/')).length,0);
+  });
+  it('journals directories before writes and recovers interrupted creation idempotently',async()=>{
+    const f=await fixture({'a/.gitkeep':'','b/.gitkeep':'','note.md':'note'});f.files.failDirectory='b';
+    await assert.rejects(f.imported(),/interrupted/);assert.deepEqual(f.store.state!.journal!.directories,['a','b']);assert.equal(f.files.data.size,0);
+    f.files.set('user.md','later edit');f.files.failDirectory='';await f.make().recover();
+    assert.equal(f.files.text('user.md'),'later edit');assert.equal(f.files.text('note.md'),'note');assert.deepEqual([...f.files.directories].sort(),['a','b']);
+    await f.make().recover();assert.equal(f.files.text('user.md'),'later edit');assert.equal(f.store.state!.journal,undefined);
+  });
+  it('restores safe directories removed after preview and returns a directory-only apply result',async()=>{
+    const f=await fixture({'empty/.gitkeep':''});f.files.directories.add('empty');
+    const plan=await f.engine.planPull();assert.deepEqual(plan.directories,[]);f.files.directories.delete('empty');
+    const result=await f.engine.applyPull(plan);assert.deepEqual(result,{preserved:[]});assert(f.files.directories.has('empty'));
+    assert.equal(f.store.state!.head,f.current());assert.equal(f.files.data.size,0);
+  });
+  it('restores previously existing safe directories removed during recovery',async()=>{
+    const f=await fixture({'empty/.gitkeep':'','z/.gitkeep':''});f.files.directories.add('empty');
+    const plan=await f.engine.planPull();assert.deepEqual(plan.directories,['z']);f.files.failDirectory='z';
+    await assert.rejects(f.engine.applyPull(plan),/interrupted/);assert.deepEqual(f.store.state!.journal!.directories,['empty','z']);
+    const list=f.files.list.bind(f.files);let scans=0;f.files.list=async()=>{if(++scans===2)f.files.directories.delete('empty');return list();};
+    f.files.failDirectory='';await f.make().recover();
+    assert.deepEqual([...f.files.directories].sort(),['empty','z']);assert.equal(f.store.state!.journal,undefined);
+  });
+  it('bounds complete recovery inventory scans independently of one or one hundred existing directories',async()=>{
+    const counts: number[]=[];
+    for(const count of [1,100]) {
+      const f=await fixture({});const directories=Array.from({length:count},(_,i)=>`folder-${i}`);
+      for(const path of directories)f.files.directories.add(path);
+      f.store.state={version:1,repository:'example/notes',branch:'main',head:'',baseline:{},journal:{
+        head:f.current(),baseline:{},entries:[],directories,inventory:{files:directories.map(path=>`${path}/.gitkeep`),directories},
+      }};
+      const list=f.files.list.bind(f.files);let scans=0;f.files.list=async()=>{scans++;return list();};
+      await f.make().recover();counts.push(scans);assert(scans<=3,`${count} directories triggered ${scans} full scans`);
+      assert.equal(f.files.directories.size,count);assert.equal(f.files.data.size,0);assert.equal(f.store.state!.journal,undefined);
+    }
+    assert.equal(counts[0],counts[1]);
+  });
+  it('detects namespace collisions introduced during directory creation before writing document bodies',async()=>{
+    const f=await fixture({'empty/.gitkeep':'','note.md':'remote'});const mkdir=f.files.mkdir.bind(f.files);
+    f.files.mkdir=async(path)=>{await mkdir(path);f.files.set('Empty','user file');};
+    await assert.rejects(f.imported(),/冲突|collision/);assert.equal(f.files.text('Empty'),'user file');assert.equal(f.files.text('note.md'),null);assert(f.store.state!.journal);
+  });
+  it('verifies and repairs required directories once more after document writes',async()=>{
+    const f=await fixture({'empty/.gitkeep':'','note.md':'remote'});const write=f.files.write.bind(f.files);
+    f.files.write=async(path,bytes)=>{await write(path,bytes);f.files.directories.delete('empty');};
+    await f.imported();assert(f.files.directories.has('empty'));assert.equal(f.files.text('note.md'),'remote');assert.equal(f.store.state!.journal,undefined);
+  });
+  it('keeps the journal and stops before document writes when directory removals continue during bounded repair',async()=>{
+    const f=await fixture({'a/.gitkeep':'','b/.gitkeep':'','note.md':'remote'});const mkdir=f.files.mkdir.bind(f.files);
+    f.files.mkdir=async(path)=>{await mkdir(path);f.files.directories.delete(path==='a'?'b':'a');};
+    await assert.rejects(f.imported(),/目录.*创建验证失败/);assert.equal(f.files.text('note.md'),null);assert(f.store.state!.journal);
+  });
+  it('returns apply-time preserved paths when later user edits replace reviewed file contents',async()=>{
+    const f=await fixture();await f.imported();f.advance({'first.md':'remote replacement'});const plan=await f.engine.planPull();
+    f.controls.transform=(path,json)=>{if(path==='ref/heads/main')f.files.set('first.md','later user edit');return json;};
+    const result=await f.engine.applyPull(plan);assert.deepEqual(result,{preserved:['first.md']});
+    assert.equal(f.files.text('first.md'),'later user edit');assert.equal(f.files.text('first.recovery-copy.md'),'one\ntwo\nthree\n');
+    assert.equal((await f.engine.review()).changes.find(change=>change.path==='first.md')?.status,'modify');
+  });
+  it('checks full directory inventories for case, Unicode and file collisions before journals and during recovery',async()=>{
+    for(const [remoteDirectory,localPath] of [['Empty','empty'],['caf\u00e9','cafe\u0301'],['folder','folder']]) {
+      const f=await fixture({[`${remoteDirectory}/.gitkeep`]:''});f.files.set(localPath!,'user');
+      // An existing initialized vault may contain its own unsupported local file.
+      f.store.state={version:1,repository:'example/notes',branch:'main',head:f.current(),baseline:{}};
+      await assert.rejects(f.engine.planPull(),/冲突|collision/);assert.equal(f.store.saves,0);assert.equal(f.files.text(localPath!),'user');
+    }
+    const f=await fixture({'Empty/.gitkeep':'','later/.gitkeep':''});f.files.failDirectory='Empty';await assert.rejects(f.imported());
+    f.files.failDirectory='';f.files.set('empty','later user file');await assert.rejects(f.make().recover(),/冲突|collision/);
+    assert.equal(f.files.text('empty'),'later user file');assert(f.store.state!.journal);assert.equal(f.files.directories.size,0);
+  });
+  it('names every required unsafe remote file and leaves no false-complete state',async()=>{
+    for(const failure of ['large','corrupt','secret','sha']) {
+      const f=await fixture({'required.md':failure==='secret'?'-----BEGIN PRIVATE KEY-----':'required'});
+      f.controls.transform=(path,json)=>{
+        if(failure==='large'&&path.startsWith('trees/')) {const value=json as {tree: {type:string;size:number}[]};value.tree.find(entry=>entry.type==='blob')!.size=21*1024*1024;}
+        if(failure==='corrupt'&&path.startsWith('blobs/'))(json as {content:string}).content='AAAA';
+        if(failure==='sha'&&path.startsWith('trees/'))(json as {tree: {sha:string}[]}).tree[0]!.sha='invalid';
+        return json;
+      };
+      await assert.rejects(f.engine.planPull(),error=>error instanceof Error&&error.message.includes('required.md'));
+      assert.equal(f.store.state,null);assert.equal(f.files.data.size,0);assert.equal(f.files.directories.size,0);
+    }
+  });
   it('requires an actual filename extension in the shared upload policy',()=>{
     for(const path of ['md','txt','png','folder/md','folder/pdf','folder.csv/txt'])assert.equal(allowedPath(path),false,path);
     assert.equal(allowedPath('中文/note.MD'),true);
@@ -322,7 +452,7 @@ describe('portable mobile synchronization against a local HTTP and bare Git fixt
   });
   it('checks the full proposed upload tree against excluded remote paths before the first POST',async()=>{
     for(const [remotePath,localPath] of [['Notes/private.docx','notes/new.md'],['folder','folder/new.md'],['caf\u00e9/private.docx','cafe\u0301/new.md']]) {
-      const f=await fixture({[remotePath!]:'excluded remote original'});await f.imported();f.files.set(localPath!,'new');const review=await f.engine.review();const before=f.current();
+      const f=await fixture({[remotePath!]:'excluded remote original'});await f.imported();f.files.directories.clear();f.files.set(localPath!,'new');const review=await f.engine.review();const before=f.current();
       await assert.rejects(f.engine.upload(review,[localPath!],'reviewed'),/冲突|collision/);
       assert.equal(f.controls.requests.filter(request=>request.method==='POST'||request.method==='PATCH').length,0);
       assert.equal(f.current(),before);assert.equal(f.run(['show',`${before}:${remotePath}`]),'excluded remote original');assert.equal(f.files.text(localPath!),'new');

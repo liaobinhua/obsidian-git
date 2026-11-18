@@ -26,7 +26,7 @@ export default class WudaoMobile extends Plugin {
       }
       if ('uploadEnabled' in data && typeof data.uploadEnabled === 'boolean') this.settings.uploadEnabled = data.uploadEnabled;
     }
-    this.status = this.addStatusBarItem(); this.status.setText('Git：手机手动同步');
+    this.status = this.addStatusBarItem(); this.status.setText(this.modeLabel());
     this.addSettingTab(new MobileSettingsTab(this.app, this));
     this.addRibbonIcon('git-branch', '检查手机文库改动', () => { void this.showChanges(); });
     this.addCommand({ id: 'download', name: '首次下载或检查远端更新', callback: () => { void this.showPull(); } });
@@ -101,16 +101,23 @@ export default class WudaoMobile extends Plugin {
     if (this.disposed || this.repository() !== engine) throw new Error('插件设置已变化，请关闭窗口并重新检查。');
   }
 
-  async configure(settings: MobileSettings): Promise<void> {
+  modeLabel(): string { return this.settings.uploadEnabled ? 'Git：允许上传' : 'Git：仅下载'; }
+
+  async configure(settings: MobileSettings): Promise<boolean> {
+    let saved = false;
     await this.run(async () => {
       const next = { ...settings, repository: settings.repository.trim(), branch: settings.branch.trim() };
       binding(next.repository, next.branch);
+      if (next.secretName && !/^[a-z0-9-]+$/.test(next.secretName)) throw new Error('请选择本机密钥的引用名称，不要把令牌值填到名称中。');
       const state = await this.store().load();
       if (this.disposed) throw new Error('插件已停用，设置未保存。');
       if (state && (state.repository !== next.repository || state.branch !== next.branch)) throw new Error('此文库已有同步记录。连接其他仓库或分支时，请新建空白文库。');
-      this.settings = next; await this.saveData(this.settings); this.engine = undefined;
+      await this.saveData(next);
+      if (this.disposed) return;
+      this.settings = next; this.engine = undefined; saved = true;
       new Notice('设置已保存。首次使用请先检查远端并下载。');
     });
+    return saved;
   }
 
   async run(action: () => Promise<void>): Promise<void> {
@@ -126,7 +133,7 @@ export default class WudaoMobile extends Plugin {
         await view.save();
       }
       if (this.disposed) throw new Error('插件已停用，操作已停止。');
-      await action(); this.status?.setText('Git：手机手动同步');
+      await action(); this.status?.setText(this.modeLabel());
     }
     catch (error) { this.status?.setText('Git：需要检查'); new Notice(error instanceof Error ? error.message : '同步未完成，本地内容已保留。', 14000); }
     finally { this.working = false; progress.hide(); }

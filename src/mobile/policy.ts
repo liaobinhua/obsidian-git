@@ -8,12 +8,14 @@ export function validPath(path: string): boolean {
     && new TextDecoder().decode(new TextEncoder().encode(path)) === path
     && path.split('/').every(part => part.length > 0 && part !== '.' && part !== '..');
 }
-export function allowedPath(path: string): boolean {
-  const extension = /\.([^./]+)$/.exec(path)?.[1]?.toLowerCase();
+export function allowedDirectory(path: string): boolean {
   return validPath(path) && path.split('/').every(part => !part.startsWith('.')
     && !['config', 'configs', 'keys', 'ssh'].includes(part.toLowerCase())
-    && !/(?:^|[-_.])(?:secrets?|credentials?|tokens?|passwords?|private[-_]?keys?)(?:[-_.]|$)/i.test(part))
-    && extension !== undefined && extensions.has(extension);
+    && !/(?:^|[-_.])(?:secrets?|credentials?|tokens?|passwords?|private[-_]?keys?)(?:[-_.]|$)/i.test(part));
+}
+export function allowedPath(path: string): boolean {
+  const extension = /\.([^./]+)$/.exec(path)?.[1]?.toLowerCase();
+  return allowedDirectory(path) && extension !== undefined && extensions.has(extension);
 }
 export function checkPaths(paths: string[], directories: string[] = []): void {
   if (new Set(paths).size !== paths.length || new Set(directories).size !== directories.length) throw new Error('文件路径存在重复冲突（collision）。');

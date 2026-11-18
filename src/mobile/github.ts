@@ -1,10 +1,15 @@
-import type { BaselineFile, RequestPort } from './types.ts';
-import { allowedPath, binding, blobSha, budget, checkBytes, checkPaths, checkSecret, fromBase64, MAX_FILE_BYTES, object, sha, toBase64, validPath } from './policy.ts';
+import type { BaselineFile, ExcludedRemoteFile, RequestPort } from './types.ts';
+import { allowedDirectory, allowedPath, binding, blobSha, budget, checkBytes, checkPaths, checkSecret, fromBase64, MAX_FILE_BYTES, object, sha, toBase64, validPath, validSha } from './policy.ts';
 
 export interface RemoteTree {
   head: string; tree: string; files: Record<string, BaselineFile>;
   /** All remote leaf paths, including excluded files kept by base_tree uploads. */
   paths: string[];
+  /** All remote directories, including excluded namespaces, for collision checks. */
+  directories: string[];
+  excluded: ExcludedRemoteFile[];
+  totalFiles: number;
+  totalDirectories: number;
 }
 
 export class GitHubError extends Error {
@@ -64,21 +69,29 @@ export class GitHubClient {
     if (sha(result.sha) !== tree || !Array.isArray(result.tree) || result.tree.length > 100000) throw new Error('GitHub 文件树响应无效。');
     const files: Record<string, BaselineFile> = Object.create(null) as Record<string, BaselineFile>;
     const paths: string[] = [];
+    const directories: string[] = [];
+    const excluded: ExcludedRemoteFile[] = [];
     for (const raw of result.tree) {
       const entry = object(raw);
       if (typeof entry.path !== 'string' || !validPath(entry.path)) throw new Error('远端文件路径无效。');
-      if (entry.type === 'tree' && entry.mode === '040000') { sha(entry.sha); continue; }
+      if (!validSha(entry.sha)) throw new Error(`远端路径 ${entry.path} 的 SHA 响应无效。`);
+      if (entry.type === 'tree' && entry.mode === '040000') { directories.push(entry.path); continue; }
       paths.push(entry.path);
-      if (entry.type !== 'blob' || !['100644', '100755', '120000', '160000'].includes(String(entry.mode))) throw new Error('远端文件树包含不支持的节点。');
-      sha(entry.sha);
-      if (!allowedPath(entry.path)) continue;
-      if (!['100644', '100755'].includes(String(entry.mode))) throw new Error('远端文档包含链接或 gitlink，无法同步。');
-      if (typeof entry.size !== 'number' || !Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > MAX_FILE_BYTES) throw new Error('远端文件超过 20 MiB 或大小响应无效。');
+      if (entry.type !== 'blob' || !['100644', '100755', '120000', '160000'].includes(String(entry.mode))) throw new Error(`远端文件 ${entry.path} 包含不支持的节点。`);
+      if (!allowedPath(entry.path)) {
+        const name = entry.path.split('/').at(-1);
+        excluded.push({ path: entry.path, reason: name === '.gitkeep' ? '目录占位文件仅用于保留目录，正文不下载。'
+          : name === '.gitignore' ? 'Git 忽略配置不在移动端共享允许范围内。'
+          : !allowedDirectory(entry.path) ? '隐藏路径或配置、凭据目录不在移动端共享允许范围内。' : '文件扩展名不在移动端共享允许范围内。' });
+        continue;
+      }
+      if (!['100644', '100755'].includes(String(entry.mode))) throw new Error(`远端文件 ${entry.path} 包含链接或 gitlink，无法同步。`);
+      if (typeof entry.size !== 'number' || !Number.isSafeInteger(entry.size) || entry.size < 0 || entry.size > MAX_FILE_BYTES) throw new Error(`远端文件 ${entry.path} 超过 20 MiB 或大小响应无效。`);
       files[entry.path] = { sha: sha(entry.sha), size: entry.size };
     }
     if (new Set(paths).size !== paths.length) throw new Error('远端文件树响应包含重复路径。');
-    checkPaths(paths);
-    return { head, tree, files, paths };
+    checkPaths(paths, directories);
+    return { head, tree, files, paths, directories, excluded, totalFiles: paths.length, totalDirectories: directories.length };
   }
   async blob(file: BaselineFile): Promise<Uint8Array> {
     const id = sha(file.sha);

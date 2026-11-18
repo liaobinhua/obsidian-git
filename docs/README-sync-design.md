@@ -44,3 +44,11 @@ SecretStorage 保存令牌，插件配置只保存引用名。该存储关联本
 - [GitHub Git commits](https://docs.github.com/en/rest/git/commits)
 - [GitHub Git references](https://docs.github.com/en/rest/git/refs)
 - [GitHub CORS](https://docs.github.com/en/rest/using-the-rest-api/using-cors-and-jsonp-to-make-cross-origin-requests)
+
+## 7. 0.2.1 完整目录与结果反馈
+
+远端树同时保留完整叶节点和目录元数据，区分参与同步的文档与主动排除的文件。PullPlan 提供文件和目录总数、待创建目录及排除理由；.gitkeep 不作为正文下载，但其父目录会被保留。
+
+写前 journal 的可选 directories 字段保存全部安全远端目录，而不只是预览时缺失的目录，防止目录在预览后或恢复期间消失却错误报告完成。旧 schema 1 状态无需重建。应用完成会返回保留的后续本地编辑路径，界面不会把它们计作已覆盖的远端更新。
+
+Mac 在读到已验证的远端头或推送成功后，以本地引用旧值作为更新条件刷新追踪引用，不影响远端分支；并发发现更晚引用时保留它并反馈刷新状态。

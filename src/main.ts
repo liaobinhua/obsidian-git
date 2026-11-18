@@ -39,8 +39,8 @@ export default class WudaoGit extends Plugin {
     const engine = new Repository(adapter.getBasePath(), value);
     // Validate the binding before saving it. This only reads local Git state.
     await engine.review();
+    await this.saveData({ repository: value });
     this.settings.repository = value;
-    await this.saveData(this.settings);
     this.engine = engine;
   }
 
@@ -153,8 +153,8 @@ class PushModal extends Modal {
     push.addEventListener('click', () => {
       push.disabled = true;
       void this.plugin.perform(async () => {
-        await this.repository.push(this.review);
-        new Notice('所审阅的提交已上传到 GitHub。');
+        const result = await this.repository.push(this.review);
+        new Notice(result.trackingUpdated ? '所审阅的提交已上传到 GitHub。' : 'GitHub 已确认上传，本地追踪状态未刷新；请稍后检查更新或使用 Git fetch 刷新。', 10000);
         this.close();
       }).finally(() => { push.disabled = false; });
     });
@@ -171,6 +171,7 @@ class GitSettings extends PluginSettingTab {
   display(): void {
     this.containerEl.empty();
     this.containerEl.createEl('h2', { text: 'Wudao Git' });
+    this.containerEl.createEl('p', { text: `当前版本：${this.plugin.manifest.version}。文章修改需先提交，再确认推送到 GitHub。` });
     this.containerEl.createEl('p', { text: '仅手动同步到绑定的 GitHub 仓库。认证由本机 Git 和 macOS 钥匙串处理。' });
     let repository = this.plugin.settings.repository;
     new Setting(this.containerEl)

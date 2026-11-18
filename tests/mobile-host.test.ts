@@ -45,6 +45,12 @@ test('mobile vault adapter handles ordinary documents and excludes internal fold
   await files.remove('感悟/第一篇.md');
   assert.equal(await files.read('感悟/第一篇.md'), null);
   await assert.rejects(files.read('../private.md'), /路径|范围/);
+  await files.mkdir('空分类/子分类'); await files.mkdir('空分类/子分类');
+  assert.equal((await adapter.stat('空分类/子分类'))?.type, 'folder');
+  await assert.rejects(files.mkdir('.obsidian/unsafe'), /目录|范围/);
+  await files.write('file.md', new TextEncoder().encode('keep'));
+  await assert.rejects(files.mkdir('file.md'), /目录/);
+  assert.equal(new TextDecoder().decode((await files.read('file.md'))!), 'keep');
 });
 
 test('adapter rejects malformed directory listings and propagates unreadable errors', async () => {

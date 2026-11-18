@@ -1,4 +1,4 @@
-import { allowedPath, checkBytes, validPath } from './mobile/policy.ts';
+import { allowedDirectory, allowedPath, checkBytes, validPath } from './mobile/policy.ts';
 import type { LocalFiles, MobileState, RequestPort, StateStore } from './mobile/types.ts';
 
 export interface HostAdapter {
@@ -63,6 +63,11 @@ export class MobileFiles implements LocalFiles {
     if (!allowedPath(path)) throw new Error('文件路径不在允许同步的范围。');
     const slash = path.lastIndexOf('/');
     return slash < 0 || await directory(this.adapter, path.slice(0, slash), create, this.actions.mkdir);
+  }
+
+  async mkdir(path: string): Promise<void> {
+    if (!allowedDirectory(path)) throw new Error('目录路径不在允许同步的范围。');
+    await directory(this.adapter, path, true, this.actions.mkdir);
   }
 
   async read(path: string): Promise<Uint8Array | null> {

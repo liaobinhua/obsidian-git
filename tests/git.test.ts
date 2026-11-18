@@ -1,6 +1,7 @@
 import { afterEach, describe, it } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import { writeFileSync } from 'node:fs';
 import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
@@ -45,11 +46,14 @@ describe('upload policy', () => {
 class LocalRepository extends Repository {
   remote: string;
   offline = false;
+  afterPush?: () => void;
   constructor(root: string, remote: string) { super(root, 'example/notes'); this.remote = remote; }
   protected override async transfer(args: string[]): Promise<Buffer> {
     if (this.offline) throw new Error('测试网络不可用');
     assert.equal(args.filter(arg => arg === this.url).length, 1);
-    return Buffer.from(git(this.root, ...args.map(arg => arg === this.url ? this.remote : arg)));
+    const result = Buffer.from(git(this.root, ...args.map(arg => arg === this.url ? this.remote : arg)));
+    if (args[0] === 'push') this.afterPush?.();
+    return result;
   }
 }
 
@@ -69,9 +73,36 @@ describe('reviewed synchronization with a real bare Git remote', () => {
     const plan = await repo.reviewPush();
     assert.deepEqual(plan.commits.map(c => c.subject), ['Reviewed note']);
     assert.deepEqual(plan.commits[0]?.files, ['new.md']);
-    await repo.push(plan);
+    const result = await repo.push(plan);
+    assert.equal(result.trackingUpdated, true);
     assert.equal(git(remote, 'rev-parse', 'main').trim(), plan.head);
+    assert.equal(git(root, 'rev-parse', 'origin/main').trim(), plan.head);
+    assert.equal(git(root, 'rev-parse', 'refs/remotes/wudao-git/main').trim(), plan.head);
     assert.equal((await repo.reviewPush()).commits.length, 0);
+  });
+  it('preserves a newer local tracking reference while reporting the successful remote upload', async () => {
+    const { root, remote, repo } = await connected();
+    await writeFile(join(root, 'new.md'), 'new');
+    await repo.commit(await repo.review(), ['new.md'], 'Reviewed note');
+    const plan = await repo.reviewPush();
+    const ahead = git(root, 'commit-tree', git(root, 'rev-parse', 'HEAD^{tree}').trim(), '-p', plan.head, '-m', 'Newer snapshot').trim();
+    git(root, 'update-ref', 'refs/remotes/origin/main', ahead);
+    const result = await repo.push(plan);
+    assert.equal(result.trackingUpdated, false);
+    assert.equal(git(remote, 'rev-parse', 'main').trim(), plan.head);
+    assert.equal(git(root, 'rev-parse', 'origin/main').trim(), ahead);
+  });
+  it('reports an acknowledged push when the local tracking cache cannot be read safely', async () => {
+    const { root, remote, repo } = await connected();
+    await writeFile(join(root, 'new.md'), 'new');
+    await repo.commit(await repo.review(), ['new.md'], 'Reviewed note');
+    const plan = await repo.reviewPush();
+    // A missing object simulates a cache failure after the server acknowledged the push.
+    repo.afterPush = () => { writeFileSync(join(root, '.git/refs/remotes/origin/main'), 'f'.repeat(40)+'\n'); };
+    const result = await repo.push(plan);
+    assert.equal(result.trackingUpdated, false);
+    assert.equal(git(remote, 'rev-parse', 'main').trim(), plan.head);
+    assert.equal(result.commit, plan.head);
   });
   it('blocks a secret that was added and deleted in earlier unpushed commits', async () => {
     const { root, repo } = await connected();

@@ -6,7 +6,7 @@
 
 Wudao Git 为 macOS 和 Android 提供手动、审阅后执行的 GitHub 文库同步。Mac 通过本机 Git 操作，Android 通过 GitHub API 操作同一分支。本文提供安装入口、使用条件、文件策略和验证命令。
 
-这是独立实现，与 `Vinzent03/obsidian-git` 没有隶属关系。插件 ID 为 `wudao-git`。0.2.0 的 Android 包为候选版本：自动化测试和无 Node 加载检查不能替代 Android 真机验证。
+这是独立实现，与 `Vinzent03/obsidian-git` 没有隶属关系。插件 ID 为 `wudao-git`。0.2.1 的 Android 包为候选版本：自动化测试和无 Node 加载检查不能替代 Android 真机验证。
 
 ### 0.2 References
 
@@ -18,8 +18,8 @@ Wudao Git 为 macOS 和 Android 提供手动、审阅后执行的 GitHub 文库�
 
 | 平台 | 安装包 | 使用条件 |
 |---|---|---|
-| macOS | `wudao-git-0.2.0-macos.zip` | Obsidian 1.13.0+，`/usr/bin/git`，macOS 钥匙串 |
-| Android | `wudao-git-0.2.0-android.zip` | Obsidian 1.13.0+，提供 Web Crypto 的 Android System WebView |
+| macOS | `wudao-git-0.2.1-macos.zip` | Obsidian 1.13.0+，`/usr/bin/git`，macOS 钥匙串 |
+| Android | `wudao-git-0.2.1-android.zip` | Obsidian 1.13.0+，提供 Web Crypto 的 Android System WebView |
 
 在手机上使用 Android 包，在电脑上使用 Mac 包。将安装包内的 `main.js`、`manifest.json` 和 `styles.css` 复制到文库的 `.obsidian/plugins/wudao-git/`，然后启用 Wudao Git。ZIP 同时包含 MIT 许可文件。请先停用其他操作同一文库的 Git 同步插件。
 
@@ -44,13 +44,14 @@ git config user.email "YOUR_NOREPLY_EMAIL"
 4. 保持默认的仅下载模式，运行“首次下载或检查远端更新”，审阅后应用。
 5. 检查文章、模板和附件后启用“允许上传”。以后写作前检查远端，写完检查并上传选中文件。
 
-手机的本地保存和离线审阅不是 Git 提交；点击最终上传确认后，插件才通过 GitHub API 创建提交并更新分支。换设备前应完成上传，在另一设备开始写作前先获取更新。
+手机的本地保存和离线审阅不是 Git 提交；点击最终上传确认后，插件才通过 GitHub API 创建提交并更新分支。换设备前应完成上传，在另一设备开始写作前先获取更新。文章更新使用插件的审阅上传流程；插件版本更新则从 Releases 下载相应平台的安装包，保留原有数据与同步记录后覆盖三个程序文件。
 
 ## 4. 文件规则与限制
 
 - 允许 `.md`、`.txt`、`.csv`、`.pdf`、`.png`、`.jpg`、`.jpeg`、`.gif` 和 `.webp`。单文件最多 20 MiB，单次操作及其备份合计最多 50 MiB。
 - 共享策略拒绝隐藏路径、常见凭据路径、路径穿越和不安全文件名。Android 还检查大小写、Unicode 及文件/目录冲突。主机 API 可识别的链接会被拒绝，手机 API 不提供操作系统级路径隔离。
 - 常见令牌和私钥标记会阻止同步，无法识别全部敏感内容。上传前仍需人工检查。
+- Android 会按远端安全目录结构补齐分类，包括仅有 .gitkeep 占位文件的目录；排除文件仍展示具体理由。旧文库升级后重新检查即可补齐目录。
 - Android 采用共享白名单和排除策略，不实现完整原生 `.gitignore` 语义。Mac 还遵守本机 Git 忽略规则。未托管文件不会被手机上传覆盖。
 
 ## 5. 安全范围
@@ -58,6 +59,8 @@ git config user.email "YOUR_NOREPLY_EMAIL"
 Mac 固定调用 `/usr/bin/git`，参数分开传递，不启动 Shell；子进程不继承令牌、Git 路径覆盖和外部 askpass。Git hooks、fsmonitor 被禁用，仓库 URL 重写、HTTP 覆盖和文件过滤器配置会被拒绝。
 
 Android 仅请求固定的 `https://api.github.com` Git 数据接口，拒绝 HTTP 重定向、跨域凭据转发和任意 `download_url`。默认仅下载模式在传输层拒绝远端写请求。令牌使用 Obsidian SecretStorage；它是文库关联的本机存储，不是针对其他插件的独立沙箱，也不能等同于 Android 硬件密钥库。
+
+推送成功后，Mac 会刷新已验证远端对应的本地追踪引用，避免 URL 推送造成“领先提交”误报；若本地引用已被其他操作推进，不会回退它。
 
 运行时没有第三方 JavaScript 依赖，没有遥测、自更新或任意命令入口。构建依赖锁定在锁文件中。Obsidian、本机 Git、WebView 和用户设备仍属于信任范围。私有 GitHub 仓库保存可读的文章和历史，不提供本插件实现的端到端加密。
 

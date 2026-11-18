@@ -2,6 +2,7 @@ import { App, Modal, Notice, PluginSettingTab, SecretComponent, Setting } from '
 import type WudaoMobile from './mobile-main.ts';
 import type { MobileSettings } from './mobile-main.ts';
 import type { MobileEngine, MobileReview, PullPlan, Resolution, Confirmation } from './mobile/index.ts';
+import { appliedSummary, pullSummary } from './mobile-presentation.ts';
 
 function confirmation(container: HTMLElement, paths: string[]): () => Confirmation {
   const approved = new Set<string>(); let bulkDelete = false;
@@ -25,14 +26,15 @@ abstract class ReviewModal extends Modal {
     super(app); this.plugin = plugin; this.engine = engine;
     this.untrack = plugin.trackWindow(() => { this.close(); });
   }
-  protected actions(text: string, action: () => Promise<void>): void {
+  protected actions(text: string, action: () => Promise<void>, enabled = true): void {
     const row = this.contentEl.createDiv({ cls: 'wudao-git-actions' });
     const primary = row.createEl('button', { text, cls: 'mod-cta' });
+    primary.disabled = !enabled;
     const cancel = row.createEl('button', { text: '关闭' }); cancel.addEventListener('click', () => { this.close(); });
     primary.addEventListener('click', () => {
       primary.disabled = true; cancel.disabled = true;
       void this.plugin.run(async () => { this.plugin.assertEngine(this.engine); await action(); })
-        .finally(() => { if (!this.closed) { primary.disabled = false; cancel.disabled = false; } });
+        .finally(() => { if (!this.closed) { primary.disabled = !enabled; cancel.disabled = false; } });
     });
   }
   protected caption(): void { this.contentEl.addClass('wudao-git'); this.contentEl.createEl('p', { text: `${this.plugin.settings.repository} · ${this.plugin.settings.branch}` }); }
@@ -44,6 +46,7 @@ export class ChangesModal extends ReviewModal {
   constructor(app: App, plugin: WudaoMobile, engine: MobileEngine, review: MobileReview) { super(app, plugin, engine); this.review = review; }
   onOpen(): void {
     this.setTitle('检查手机文库改动'); this.caption();
+    if (!this.plugin.settings.uploadEnabled) this.contentEl.createEl('p', { text: '当前为仅下载模式，可以离线审阅。需要上传时，请在设置中开启“允许上传”并保存，然后重新检查文件。' });
     this.contentEl.createEl('p', { text: '此步骤可以离线检查。勾选文件后还需确认上传，才会修改 GitHub。' });
     const selected = new Set<string>();
     const list = this.contentEl.createDiv({ cls: 'wudao-git-list' });
@@ -75,17 +78,18 @@ export class UploadModal extends ReviewModal {
   }
   onOpen(): void {
     this.setTitle(this.retry ? '核对并重试原提交' : '确认上传到 GitHub'); this.caption();
+    if (!this.plugin.settings.uploadEnabled) this.contentEl.createEl('p', { text: '上传已关闭。请先在设置中开启“允许上传”并保存，再重新打开审阅窗口。' });
     this.contentEl.createEl('p', { text: this.message });
     if (this.retry) this.contentEl.createEl('p', { text: '重试的是先前创建的同一提交，不会混入手机后续编辑。后续编辑仍会保留在本地。' });
     const list = this.contentEl.createEl('ul'); for (const path of this.selected) list.createEl('li', { text: path });
     const paths = this.review.changes.filter(c => this.selected.includes(c.path) && c.status === 'delete').map(c => c.path);
     const approval = confirmation(this.contentEl, paths);
     this.contentEl.createEl('p', { text: '上传成功以远端确认结果为准。普通删除不会清除 Git 历史。' });
-    this.actions('确认上传', async () => {
+    this.actions(this.plugin.settings.uploadEnabled ? '确认上传' : '仅下载模式，上传已关闭', async () => {
       if (!this.plugin.settings.uploadEnabled) throw new Error('当前为仅下载模式，请先在插件设置中启用上传。');
       const hash = await this.engine.upload(this.review, this.selected, this.message, approval());
       new Notice(`GitHub 已确认上传：${hash.slice(0, 8)}`); this.close();
-    });
+    }, this.plugin.settings.uploadEnabled);
   }
 }
 
@@ -94,11 +98,14 @@ export class DownloadModal extends ReviewModal {
   constructor(app: App, plugin: WudaoMobile, engine: MobileEngine, plan: PullPlan) { super(app, plugin, engine); this.plan = plan; }
   onOpen(): void {
     this.setTitle(this.plan.initial ? '确认首次下载' : '检查远端更新与冲突'); this.caption();
+    this.contentEl.createEl('p', { text: pullSummary(this.plan) });
+    this.contentEl.createEl('p', { text: `本次核对到 GitHub 提交 ${this.plan.head.slice(0, 8)}。` });
     this.contentEl.createEl('p', { text: '先检查变化。冲突必须逐项选择；保留两份会将手机原文保存为 local-copy 文件。' });
     const resolutions: Record<string, Resolution> = Object.create(null) as Record<string, Resolution>;
     const list = this.contentEl.createDiv({ cls: 'wudao-git-list' });
     const preview = this.contentEl.createEl('pre', { cls: 'wudao-git-preview', text: '点击“查看”比较基线、本地和远端。' });
-    if (!this.plan.changes.length) list.createEl('p', { text: '本地与远端内容一致。' });
+    if (!this.plan.changes.length && !this.plan.directories.length) list.createEl('p', { text: '文档内容与目录结构一致，没有待应用更新。' });
+    for (const path of this.plan.directories) list.createEl('p', { text: `待创建目录 · ${path}` });
     for (const change of this.plan.changes) {
       const row = list.createDiv({ cls: 'wudao-git-row' });
       row.createSpan({ text: `${({ remote: '远端更新', local: '保留本地待上传', conflict: '冲突', same: '两端一致' })[change.kind]} · ${change.path}` });
@@ -112,12 +119,18 @@ export class DownloadModal extends ReviewModal {
       });
     }
     if (this.plan.deletions.length) this.contentEl.createEl('p', { text: '远端删除需逐项确认。冲突选择“保留手机版本”时，该原文不会删除。' });
+    if (this.plan.summary.excluded.length) {
+      const excluded = this.contentEl.createEl('details');
+      excluded.createEl('summary', { text: `查看 ${this.plan.summary.excluded.length} 个主动排除文件及原因` });
+      const entries = excluded.createEl('ul');
+      for (const entry of this.plan.summary.excluded) entries.createEl('li', { text: `${entry.path}：${entry.reason}` });
+    }
     const approval = confirmation(this.contentEl, this.plan.deletions);
     this.actions('应用已检查的更新', async () => {
       const approved = approval();
       const effective = this.plan.deletions.filter(path => resolutions[path] !== 'local');
-      await this.engine.applyPull(this.plan, resolutions, { deletions: approved.deletions.filter(path => effective.includes(path)), bulkDelete: approved.bulkDelete });
-      new Notice('下载更新已完成。本地尚未上传的修改会继续保留。'); this.close();
+      const result = await this.engine.applyPull(this.plan, resolutions, { deletions: approved.deletions.filter(path => effective.includes(path)), bulkDelete: approved.bulkDelete });
+      new Notice(appliedSummary(this.plan, resolutions, result.preserved), 14000); this.close();
     });
   }
 }
@@ -127,15 +140,17 @@ export class MobileSettingsTab extends PluginSettingTab {
   constructor(app: App, plugin: WudaoMobile) { super(app, plugin); this.plugin = plugin; }
   display(): void {
     this.containerEl.empty(); this.containerEl.createEl('h2', { text: 'Wudao Git · Android' });
+    this.containerEl.createEl('p', { text: `当前版本：${this.plugin.manifest.version}。${this.plugin.modeLabel()}。` });
+    this.containerEl.createEl('a', { text: '查看插件安装包与升级说明', href: 'https://github.com/liaobinhua/obsidian-git/releases', attr: { target: '_blank', rel: 'noopener noreferrer' } });
     this.containerEl.createEl('p', { text: '首次使用请在空白文库下载。手机使用专用令牌，不会共享电脑钥匙串。' });
     const next: MobileSettings = { ...this.plugin.settings };
-    new Setting(this.containerEl).setName('GitHub 仓库').setDesc('填写 owner/repository。').addText(text => { text.setValue(next.repository).setPlaceholder('owner/repository').onChange(value => { next.repository = value; }); });
+    new Setting(this.containerEl).setName('GitHub 仓库').setDesc('填写文章仓库的 owner/repository；它与下载插件的源码仓库可以不同。').addText(text => { text.setValue(next.repository).setPlaceholder('owner/repository').onChange(value => { next.repository = value; }); });
     new Setting(this.containerEl).setName('分支').addText(text => { text.setValue(next.branch).onChange(value => { next.branch = value; }); });
     new Setting(this.containerEl).setName('手机专用令牌').setDesc('仅在本机 SecretStorage 中保存。插件配置只保存引用名称。')
       .addComponent(element => new SecretComponent(this.app, element).setValue(next.secretName).onChange(value => { next.secretName = value ?? ''; }));
     new Setting(this.containerEl).setName('允许上传').setDesc('默认关闭。首次下载并检查内容后，再启用手机上传。').addToggle(toggle => { toggle.setValue(next.uploadEnabled).onChange(value => { next.uploadEnabled = value; }); });
     new Setting(this.containerEl).addButton(button => { button.setButtonText('保存设置').setCta().onClick(() => { void this.plugin.configure(next); }); });
-    new Setting(this.containerEl).addButton(button => { button.setButtonText('首次下载或检查更新').onClick(() => { void this.plugin.showPull(); }); });
+    new Setting(this.containerEl).addButton(button => { button.setButtonText('保存并检查远端更新').onClick(async () => { if (await this.plugin.configure(next)) await this.plugin.showPull(); }); });
     this.containerEl.createEl('p', { text: '已有文章的文库不会被当作空白文库覆盖。更换仓库或分支时，请创建新的空白文库。' });
   }
 }

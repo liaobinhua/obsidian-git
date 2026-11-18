@@ -1,6 +1,6 @@
 import { GitHubClient, type RemoteTree } from './github.ts';
-import type { ApplyEntry, BaselineFile, Confirmation, LocalFiles, MobileChange, MobileReview, MobileState, PullPlan, Resolution, StateStore } from './types.ts';
-import { allowedPath, binding, blobSha, budget, checkBytes, checkPaths, checkSecret, fromBase64, MAX_FILE_BYTES, object, sha, toBase64, validSha } from './policy.ts';
+import type { ApplyEntry, ApplyPullResult, BaselineFile, Confirmation, LocalFiles, MobileChange, MobileReview, MobileState, PullPlan, Resolution, StateStore } from './types.ts';
+import { allowedDirectory, allowedPath, binding, blobSha, budget, checkBytes, checkPaths, checkSecret, fromBase64, MAX_FILE_BYTES, object, sha, toBase64, validSha } from './policy.ts';
 
 type Snapshot = Record<string, BaselineFile>;
 interface Scan { files: Snapshot; blocked: MobileChange[]; visible: string[]; paths: string[]; directories: string[] }
@@ -74,7 +74,16 @@ export class MobileEngine {
       let total = 0;
       for (const entry of loaded.journal.entries) total += this.bodies({ [entry.path]: entry.before }) + this.bodies({ [entry.path]: entry.after });
       budget(total);
-      checkPaths(loaded.journal.entries.map(entry => entry.path));
+      const directories = loaded.journal.directories ?? [];
+      if (!Array.isArray(directories) || directories.some(path => typeof path !== 'string' || !allowedDirectory(path))) throw new Error('本地目录写入日志无效。');
+      checkPaths(loaded.journal.entries.map(entry => entry.path), directories);
+      if (loaded.journal.inventory) {
+        const inventory = object(loaded.journal.inventory);
+        if (!Array.isArray(inventory.files) || !Array.isArray(inventory.directories)
+          || [...inventory.files, ...inventory.directories].some(path => typeof path !== 'string')) throw new Error('远端路径日志无效。');
+        checkPaths(inventory.files as string[], inventory.directories as string[]);
+        checkPaths([...new Set([...inventory.files as string[], ...loaded.journal.entries.map(entry => entry.path)])], [...new Set([...inventory.directories as string[], ...directories])]);
+      }
     }
     return loaded;
   }
@@ -116,6 +125,10 @@ export class MobileEngine {
     const bytes = await this.read(path);
     if ((bytes === null ? deleted : await blobSha(bytes)) !== identity(expected)) throw new Error('本地文件已变化，请重新检查。');
     return bytes === null ? null : toBase64(bytes);
+  }
+  private async remoteBody(path: string, file: BaselineFile): Promise<string> {
+    try { return toBase64(await this.client.blob(file)); }
+    catch (error) { throw new Error(`远端文件 ${path} 无法安全下载：${error instanceof Error ? error.message : '文件校验失败。'}`); }
   }
   async status(): Promise<{ initialized: boolean; recovery: boolean; pendingUpload: boolean }> {
     return this.exclusive(async () => { const state = await this.state(); return { initialized: !!state.head, recovery: !!state.journal, pendingUpload: !!state.pending }; });
@@ -171,10 +184,15 @@ export class MobileEngine {
       }
       const local = await this.scan();
       if (!state.head && local.visible.length) throw new Error('首次导入仅允许空文档文库（empty vault）。');
-      if (local.blocked.some(change => allowedPath(change.path))) throw new Error('本地文档无法安全读取，请先检查。');
+      const blocked = local.blocked.find(change => allowedPath(change.path));
+      if (blocked) throw new Error(`本地文件 ${blocked.path} 无法安全读取，请先检查。`);
       const remote = await this.client.snapshot();
-      checkPaths([...new Set([...local.paths, ...remote.paths])], local.directories);
-      const plan: PullPlan = { id: crypto.randomUUID(), head: remote.head, initial: !state.head, changes: [], deletions: [] };
+      checkPaths([...new Set([...local.paths, ...remote.paths])], [...new Set([...local.directories, ...remote.directories])]);
+      const plan: PullPlan = {
+        id: crypto.randomUUID(), head: remote.head, initial: !state.head, changes: [], deletions: [],
+        directories: remote.directories.filter(path => allowedDirectory(path) && !local.directories.includes(path)).sort((a,b) => a.split('/').length - b.split('/').length || a.localeCompare(b)),
+        summary: { remoteFiles: remote.totalFiles, managedFiles: Object.keys(remote.files).length, remoteDirectories: remote.totalDirectories, excluded: clone(remote.excluded) },
+      };
       const entries: ApplyEntry[] = [];
       let size = 0;
       for (const path of keys(state.baseline, local.files, remote.files)) {
@@ -187,7 +205,7 @@ export class MobileEngine {
           size += (local.files[path]?.size ?? 0) + (remote.files[path]?.size ?? 0); budget(size);
           const before = await this.snapshot(path, local.files[path]);
           const file = remote.files[path];
-          entries.push({ path, before, after: file ? toBase64(await this.client.blob(file)) : null });
+          entries.push({ path, before, after: file ? await this.remoteBody(path, file) : null });
         }
       }
       this.plans.clear();
@@ -202,10 +220,10 @@ export class MobileEngine {
       const entry = stored.entries.find(entry => entry.path === path);
       const base = stored.base[path];
       const total = (base?.size ?? 0) + (stored.local[path]?.size ?? 0) + (stored.remote.files[path]?.size ?? 0); budget(total);
-      const before = base ? toBase64(await this.client.blob(base)) : null;
+      const before = base ? await this.remoteBody(path, base) : null;
       const local = entry?.before ?? await this.snapshot(path, stored.local[path]);
       const file = stored.remote.files[path];
-      const incoming = entry ? entry.after : file ? toBase64(await this.client.blob(file)) : null;
+      const incoming = entry ? entry.after : file ? await this.remoteBody(path, file) : null;
       return `基线\n${this.display(path, before)}\n\n本地\n${this.display(path, local)}\n\n远端\n${this.display(path, incoming)}`;
     });
   }
@@ -214,7 +232,7 @@ export class MobileEngine {
     if (!confirmation || new Set(confirmation.deletions).size !== confirmation.deletions.length || JSON.stringify([...paths].sort()) !== JSON.stringify([...confirmation.deletions].sort())) throw new Error('请明确确认本次预览中的删除文件（deletions）。');
     if (paths.length >= 2 && !confirmation.bulkDelete) throw new Error('批量删除（bulk delete）需要额外确认。');
   }
-  async applyPull(plan: PullPlan, resolutions: Record<string, Resolution> = {}, confirmation?: Confirmation): Promise<void> {
+  async applyPull(plan: PullPlan, resolutions: Record<string, Resolution> = {}, confirmation?: Confirmation): Promise<ApplyPullResult> {
     return this.exclusive(async () => {
       const state = await this.state(); this.ready(state);
       const stored = this.plans.get(plan.id);
@@ -222,11 +240,11 @@ export class MobileEngine {
       if (state.pending) throw new Error('请先核对上次上传。');
       for (const change of stored.plan.changes) if (change.kind === 'conflict' && !['local', 'remote', 'both'].includes(resolutions[change.path] ?? '')) throw new Error('存在冲突（conflict），请逐个选择本地、远端或两者。');
       const local = await this.scan();
-      checkPaths([...new Set([...local.paths, ...stored.remote.paths])], local.directories);
+      checkPaths([...new Set([...local.paths, ...stored.remote.paths])], [...new Set([...local.directories, ...stored.remote.directories])]);
       if (stored.plan.initial && local.visible.length || local.blocked.some(change => allowedPath(change.path)) || !sameSnapshot(local.files, stored.local)) throw new Error('本地文件已变化，请重新检查。');
       if (await this.client.head() !== stored.remote.head) throw new Error('远端已变化，请重新检查。');
       const entries: ApplyEntry[] = [];
-      const existing = new Set([...local.paths, ...local.directories, ...stored.remote.paths]);
+      const existing = new Set([...local.paths, ...local.directories, ...stored.remote.paths, ...stored.remote.directories]);
       for (const entry of stored.entries) {
         const conflict = stored.plan.changes.find(change => change.path === entry.path)?.kind === 'conflict';
         if (conflict && resolutions[entry.path] === 'local') continue;
@@ -250,19 +268,54 @@ export class MobileEngine {
       const paths = latest.filter(entry => entry.kind === 'file').map(entry => entry.path);
       const directories = latest.filter(entry => entry.kind === 'directory').map(entry => entry.path);
       checkPaths(paths, directories);
-      checkPaths([...new Set([...paths, ...stored.remote.paths, ...entries.map(entry => entry.path)])], directories);
+      checkPaths([...new Set([...paths, ...stored.remote.paths, ...entries.map(entry => entry.path)])], [...new Set([...directories, ...stored.remote.directories])]);
       if (stored.plan.initial && paths.some(path => !path.split('/').some(part => part.startsWith('.')))) throw new Error('首次导入期间文库已变化，请重新检查。');
-      state.journal = { head: stored.remote.head, baseline: stored.remote.files, entries };
-      delete state.draft;
+      state.journal = {
+        head: stored.remote.head, baseline: stored.remote.files, entries,
+        directories: stored.remote.directories.filter(allowedDirectory).sort((a,b) => a.split('/').length - b.split('/').length || a.localeCompare(b)),
+        inventory: { files: stored.remote.paths, directories: stored.remote.directories },
+      };
+      if (entries.length || state.head !== stored.remote.head || !sameSnapshot(state.baseline, stored.remote.files)) delete state.draft;
       await this.store.save(state);
-      await this.finishJournal(state);
+      const result = await this.finishJournal(state);
       this.plans.clear();
+      return { preserved: result.preserved };
     });
   }
   private async finishJournal(state: MobileState): Promise<{ pending: boolean; preserved: string[] }> {
     const journal = state.journal;
     if (!journal) return { pending: false, preserved: [] };
     const preserved: string[] = [];
+    // Recovery must validate the current full namespace before creating even an
+    // empty directory. New user files may have appeared since the journal save.
+    const inventory = async () => {
+      const current = await this.files.list();
+      if (current.some(entry => !['file', 'directory'].includes(entry.kind))) throw new Error('本地文件类型无效或包含链接，请先检查恢复路径。');
+      const paths = current.filter(entry => entry.kind === 'file').map(entry => entry.path);
+      const directories = current.filter(entry => entry.kind === 'directory').map(entry => entry.path);
+      checkPaths(paths, directories);
+      checkPaths([...new Set([...paths, ...(journal.inventory?.files ?? []), ...journal.entries.map(entry => entry.path)])],
+        [...new Set([...directories, ...(journal.inventory?.directories ?? []), ...(journal.directories ?? [])])]);
+      return directories;
+    };
+    await inventory();
+    const required = journal.directories ?? [];
+    // mkdir checks exact destinations and parents through the host boundary.
+    // Ensure every required directory even if it existed in the initial scan;
+    // rescanning the whole vault for each directory is quadratic on mobile.
+    for (const directory of required) await this.files.mkdir(directory);
+    const verify = async () => {
+      const current = new Set(await inventory());
+      const missing = required.filter(directory => !current.has(directory));
+      if (!missing.length) return;
+      for (const directory of missing) await this.files.mkdir(directory);
+      const checked = new Set(await inventory());
+      const absent = required.find(directory => !checked.has(directory));
+      if (absent) throw new Error(`目录 ${absent} 创建验证失败，请先恢复。`);
+    };
+    // Validate the complete namespace after directory creation and before the
+    // first document write. A removed directory gets one bounded repair pass.
+    await verify();
     for (const entry of journal.entries) {
       // Later user edits may now contain a secret. Compare without exporting or
       // persisting that content so recovery can still preserve those edits.
@@ -280,8 +333,10 @@ export class MobileEngine {
       const checked = await this.files.read(entry.path);
       if ((checked === null ? null : toBase64(checked)) !== entry.after) throw new Error('本地写入验证失败，请先恢复。');
     }
+    await verify();
+    if (journal.entries.length || state.head !== journal.head || !sameSnapshot(state.baseline, journal.baseline)) delete state.draft;
     state.head = journal.head; state.baseline = journal.baseline;
-    delete state.journal; delete state.draft;
+    delete state.journal;
     await this.store.save(state);
     return { pending: false, preserved };
   }
@@ -372,7 +427,7 @@ export class MobileEngine {
       }
       // Excluded files remain in base_tree. They must participate in namespace
       // checks too, before creating even an unattached blob on the remote.
-      checkPaths([...proposed]);
+      checkPaths([...proposed], remote.directories);
       const treeFiles: { path: string; sha: string | null }[] = [];
       // The reviewed snapshot was persisted by review(), before the first POST.
       for (const [path, body] of Object.entries(snapshots)) treeFiles.push({ path, sha: body === null ? null : await this.client.createBlob(fromBase64(body)) });
